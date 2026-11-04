@@ -291,6 +291,10 @@ _WORKFLOW_SWITCHER_JS: str = r"""
             : [],
           globalIncludeNodePacks: Boolean(parsed.globalIncludeNodePacks),
           globalIncludeBrowse: Boolean(parsed.globalIncludeBrowse),
+          savedSectionsByWorkflow:
+            parsed.savedSectionsByWorkflow && typeof parsed.savedSectionsByWorkflow === "object"
+              ? parsed.savedSectionsByWorkflow
+              : {},
           collapsedInView: Boolean(parsed.collapsedInView)
         };
       }
@@ -301,6 +305,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       globalActiveTags: [],
       globalIncludeNodePacks: false,
       globalIncludeBrowse: false,
+      savedSectionsByWorkflow: {},
       collapsedInView: false
     };
   }
@@ -928,7 +933,102 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     return null;
   }
 
-  function serializeProjectGraphToWorkflowJson(document, libraryWorkflowId) {
+  let hydratedWorkflowIds = new Set();
+
+  function captureActiveWorkflowSectionStates() {
+    const adapter = findWorkflowUiAdapter();
+    if (!adapter || !adapter.project) return null;
+    const snap = adapter.project.getSnapshot();
+    if (!snap || !snap.activeWorkflowId || !snap.projectGraph) return null;
+    const doc = snap.projectGraph;
+    const wfNameKey = (doc.name || "").trim().toLowerCase();
+    const allOpen =
+      snap.workflowValues &&
+      snap.workflowValues.formSectionsOpen &&
+      typeof snap.workflowValues.formSectionsOpen === "object"
+        ? snap.workflowValues.formSectionsOpen
+        : {};
+    const currentMap =
+      allOpen[snap.activeWorkflowId] && typeof allOpen[snap.activeWorkflowId] === "object"
+        ? allOpen[snap.activeWorkflowId]
+        : {};
+
+    const byTitleAndId = {};
+    const elements = (doc.form && doc.form.elements) || {};
+    for (const [elId, el] of Object.entries(elements)) {
+      if (el && el.type === "heading" && typeof currentMap[elId] === "boolean") {
+        byTitleAndId[elId] = currentMap[elId];
+        const titleKey = "title:" + String((el.data && el.data.content) || "").trim().toLowerCase();
+        byTitleAndId[titleKey] = currentMap[elId];
+      }
+    }
+
+    if (wfNameKey && Object.keys(byTitleAndId).length > 0) {
+      if (!switcherConfig.savedSectionsByWorkflow) switcherConfig.savedSectionsByWorkflow = {};
+      switcherConfig.savedSectionsByWorkflow[wfNameKey] = byTitleAndId;
+      saveConfig(switcherConfig);
+    }
+    return { currentMap, byTitleAndId, wfNameKey };
+  }
+
+  function syncSavedOpenSectionsForActiveWorkflow() {
+    const adapter = findWorkflowUiAdapter();
+    if (!adapter || !adapter.project || !adapter.widgets) return;
+    const snap = adapter.project.getSnapshot();
+    if (!snap || !snap.activeWorkflowId || !snap.projectGraph) return;
+    if (hydratedWorkflowIds.has(snap.activeWorkflowId)) return;
+
+    const doc = snap.projectGraph;
+    const wfNameKey = (doc.name || "").trim().toLowerCase();
+    const allOpen =
+      snap.workflowValues &&
+      snap.workflowValues.formSectionsOpen &&
+      typeof snap.workflowValues.formSectionsOpen === "object"
+        ? snap.workflowValues.formSectionsOpen
+        : {};
+    const existingForId = allOpen[snap.activeWorkflowId];
+    if (existingForId && typeof existingForId === "object" && Object.keys(existingForId).length > 0) {
+      hydratedWorkflowIds.add(snap.activeWorkflowId);
+      return;
+    }
+
+    const savedByWf =
+      wfNameKey && switcherConfig.savedSectionsByWorkflow ? switcherConfig.savedSectionsByWorkflow[wfNameKey] : null;
+    const elements = (doc.form && doc.form.elements) || {};
+    const restored = {};
+    let foundAny = false;
+
+    for (const [elId, el] of Object.entries(elements)) {
+      if (!el || el.type !== "heading") continue;
+      if (el.data && typeof el.data.defaultOpen === "boolean") {
+        restored[elId] = el.data.defaultOpen;
+        foundAny = true;
+        continue;
+      }
+      if (savedByWf && typeof savedByWf === "object") {
+        const titleKey = "title:" + String((el.data && el.data.content) || "").trim().toLowerCase();
+        if (typeof savedByWf[elId] === "boolean") {
+          restored[elId] = savedByWf[elId];
+          foundAny = true;
+        } else if (typeof savedByWf[titleKey] === "boolean") {
+          restored[elId] = savedByWf[titleKey];
+          foundAny = true;
+        }
+      }
+    }
+
+    hydratedWorkflowIds.add(snap.activeWorkflowId);
+    if (foundAny) {
+      adapter.widgets.patchValues("workflow", {
+        formSectionsOpen: {
+          ...allOpen,
+          [snap.activeWorkflowId]: restored
+        }
+      });
+    }
+  }
+
+  function serializeProjectGraphToWorkflowJson(document, libraryWorkflowId, sectionStatesMap) {
     const serializeInvNode = (node) => {
       const clonedData = JSON.parse(JSON.stringify(node.data || {}));
       delete clonedData.callSavedWorkflowFieldsFrom;
@@ -940,6 +1040,14 @@ _WORKFLOW_SWITCHER_JS: str = r"""
         type: node.type
       };
     };
+    const clonedElements = JSON.parse(JSON.stringify((document.form && document.form.elements) || {}));
+    if (sectionStatesMap && typeof sectionStatesMap === "object") {
+      for (const [elId, el] of Object.entries(clonedElements)) {
+        if (el && el.type === "heading" && el.data && typeof sectionStatesMap[elId] === "boolean") {
+          el.data.defaultOpen = sectionStatesMap[elId];
+        }
+      }
+    }
     return {
       author: document.author || "",
       contact: document.contact || "",
@@ -947,7 +1055,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       edges: (document.edges || []).map((edge) => ({ ...edge })),
       exposedFields: [],
       form: {
-        elements: JSON.parse(JSON.stringify((document.form && document.form.elements) || {})),
+        elements: clonedElements,
         rootElementId: (document.form && document.form.rootElementId) || ""
       },
       ...(libraryWorkflowId ? { id: libraryWorkflowId } : {}),
@@ -1004,8 +1112,10 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
     try {
       if (statusBtn) statusBtn.textContent = "Saving...";
+      const captured = captureActiveWorkflowSectionStates();
+      const sectionStatesMap = captured ? captured.currentMap : null;
       if (targetWorkflowId) {
-        const payload = serializeProjectGraphToWorkflowJson(doc, targetWorkflowId);
+        const payload = serializeProjectGraphToWorkflowJson(doc, targetWorkflowId, sectionStatesMap);
         const resp = await fetch("/api/v1/workflows/i/" + encodeURIComponent(targetWorkflowId), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -1033,7 +1143,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       }
 
       // Create new in Your Library if not found or if PATCH returned 404:
-      const newPayload = serializeProjectGraphToWorkflowJson(doc);
+      const newPayload = serializeProjectGraphToWorkflowJson(doc, undefined, sectionStatesMap);
       delete newPayload.id;
       const createResp = await fetch("/api/v1/workflows/", {
         method: "POST",
@@ -1116,9 +1226,13 @@ _WORKFLOW_SWITCHER_JS: str = r"""
             ownerUserId: loadedLibraryDto.user_id
           }
         );
+        hydratedWorkflowIds.delete(snap.activeWorkflowId);
+        syncSavedOpenSectionsForActiveWorkflow();
       };
       window.setTimeout(linkSource, 80);
       window.setTimeout(linkSource, 250);
+    } else {
+      window.setTimeout(syncSavedOpenSectionsForActiveWorkflow, 100);
     }
   }
 
@@ -1938,6 +2052,17 @@ _WORKFLOW_SWITCHER_JS: str = r"""
   let initialScanTriggered = false;
   let rafPending = false;
 
+  document.addEventListener(
+    "click",
+    (e) => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (target && target.closest("[data-scope='collapsible'] [data-part='trigger']")) {
+        window.setTimeout(captureActiveWorkflowSectionStates, 40);
+      }
+    },
+    true
+  );
+
   function scheduleCheck() {
     if (rafPending) return;
     rafPending = true;
@@ -1948,6 +2073,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       augmentAddFormElementMenus();
       scanEditTabSwitcherCards();
       scanViewTabSwitcherElements();
+      syncSavedOpenSectionsForActiveWorkflow();
       if (!initialScanTriggered) {
         initialScanTriggered = true;
         refreshAllWorkflows();
