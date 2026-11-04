@@ -901,6 +901,170 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     }
   }
 
+  function findWorkflowUiAdapter(startEl) {
+    const candidates = [
+      startEl,
+      document.querySelector(".inv7-wfs-edit-box"),
+      document.querySelector(".inv7-wfs-view-box"),
+      document.querySelector("input[type='file'][accept*='.json']"),
+      document.querySelector("[role='region']")
+    ];
+    for (const el of candidates) {
+      if (!el) continue;
+      const fiberKey = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+      if (!fiberKey) continue;
+      let cur = el[fiberKey];
+      while (cur) {
+        const props = cur.memoizedProps;
+        if (props && typeof props === "object") {
+          const adp = props.adapter || props.value;
+          if (adp && adp.commands && typeof adp.commands.setWorkflowSource === "function" && adp.project) {
+            return adp;
+          }
+        }
+        cur = cur.return;
+      }
+    }
+    return null;
+  }
+
+  function serializeProjectGraphToWorkflowJson(document, libraryWorkflowId) {
+    const serializeInvNode = (node) => {
+      const clonedData = JSON.parse(JSON.stringify(node.data || {}));
+      delete clonedData.callSavedWorkflowFieldsFrom;
+      delete clonedData.callSavedWorkflowStatus;
+      return {
+        data: { ...clonedData, id: node.id },
+        id: node.id,
+        position: { ...(node.position || { x: 0, y: 0 }) },
+        type: node.type
+      };
+    };
+    return {
+      author: document.author || "",
+      contact: document.contact || "",
+      description: document.description || "",
+      edges: (document.edges || []).map((edge) => ({ ...edge })),
+      exposedFields: [],
+      form: {
+        elements: JSON.parse(JSON.stringify((document.form && document.form.elements) || {})),
+        rootElementId: (document.form && document.form.rootElementId) || ""
+      },
+      ...(libraryWorkflowId ? { id: libraryWorkflowId } : {}),
+      meta: { category: "user", version: "3.0.0" },
+      name: document.name || "",
+      nodes: (document.nodes || []).map((node) =>
+        node.type === "connector"
+          ? {
+              data: { ...node.data, id: node.id, isOpen: true, type: "connector" },
+              id: node.id,
+              position: { ...(node.position || { x: 0, y: 0 }) },
+              type: node.type
+            }
+          : node.type === "notes" || node.type === "current_image"
+            ? {
+                data: { ...node.data, id: node.id, isOpen: true },
+                id: node.id,
+                position: { ...(node.position || { x: 0, y: 0 }) },
+                type: node.type
+              }
+            : serializeInvNode(node)
+      ),
+      notes: document.notes || "",
+      tags: document.tags || "",
+      version: document.workflowVersion || "1.0.0"
+    };
+  }
+
+  async function saveOrUpdateCurrentWorkflowInYours(hostDiv, statusBtn) {
+    const adapter = findWorkflowUiAdapter(hostDiv);
+    if (!adapter || typeof adapter.getProjectGraph !== "function") {
+      if (statusBtn) statusBtn.textContent = "⚠ Open via menu";
+      return;
+    }
+    const snap = adapter.project.getSnapshot();
+    const doc = adapter.getProjectGraph();
+    if (!doc) return;
+
+    const currentSource = snap.activeWorkflow && snap.activeWorkflow.source ? snap.activeWorkflow.source : null;
+    const currentNameLower = (doc.name || "").trim().toLowerCase();
+    const matchingLibItem = allDiscoveredWorkflows.find(
+      (w) =>
+        !w.isPack &&
+        !w.isDefaultLib &&
+        w.workflow_id &&
+        ((currentSource && currentSource.libraryWorkflowId === w.workflow_id) ||
+          (currentNameLower && (w.name || "").trim().toLowerCase() === currentNameLower))
+    );
+
+    const targetWorkflowId =
+      (currentSource && !String(currentSource.libraryWorkflowId || "").startsWith("default_")
+        ? currentSource.libraryWorkflowId
+        : null) || (matchingLibItem ? matchingLibItem.workflow_id : null);
+
+    try {
+      if (statusBtn) statusBtn.textContent = "Saving...";
+      if (targetWorkflowId) {
+        const payload = serializeProjectGraphToWorkflowJson(doc, targetWorkflowId);
+        const resp = await fetch("/api/v1/workflows/i/" + encodeURIComponent(targetWorkflowId), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow: payload })
+        });
+        if (resp.ok) {
+          const updatedDto = await resp.json();
+          adapter.commands.setWorkflowSource(
+            { projectId: snap.id, workflowId: snap.activeWorkflowId },
+            {
+              libraryWorkflowId: updatedDto.workflow_id,
+              revision: updatedDto.revision,
+              ownerUserId: updatedDto.user_id
+            }
+          );
+          if (statusBtn) {
+            statusBtn.textContent = "✓ Updated in Yours!";
+            window.setTimeout(() => {
+              statusBtn.textContent = "💾 Save / Update in Yours";
+            }, 1600);
+          }
+          await refreshAllWorkflows();
+          return;
+        }
+      }
+
+      // Create new in Your Library if not found or if PATCH returned 404:
+      const newPayload = serializeProjectGraphToWorkflowJson(doc);
+      delete newPayload.id;
+      const createResp = await fetch("/api/v1/workflows/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow: newPayload })
+      });
+      if (createResp.ok) {
+        const createdDto = await createResp.json();
+        adapter.commands.setWorkflowSource(
+          { projectId: snap.id, workflowId: snap.activeWorkflowId },
+          {
+            libraryWorkflowId: createdDto.workflow_id,
+            revision: createdDto.revision,
+            ownerUserId: createdDto.user_id
+          }
+        );
+        if (statusBtn) {
+          statusBtn.textContent = "✓ Saved to Yours!";
+          window.setTimeout(() => {
+            statusBtn.textContent = "💾 Save / Update in Yours";
+          }, 1600);
+        }
+        await refreshAllWorkflows();
+      } else if (statusBtn) {
+        statusBtn.textContent = "⚠ Save failed";
+      }
+    } catch (_) {
+      if (statusBtn) statusBtn.textContent = "⚠ Save error";
+    }
+  }
+
   async function activateWorkflowItem(item) {
     if (!item) return;
     const fileInput = document.querySelector("input[type='file'][accept*='.json']");
@@ -908,6 +1072,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
     let jsonText = "";
     let filename = (item.name || "workflow") + ".json";
+    let loadedLibraryDto = null;
 
     if (item.id.startsWith("file:")) {
       const folderQuery = switcherConfig.customFolders
@@ -924,6 +1089,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       const resp = await fetch("/api/v1/workflows/i/" + encodeURIComponent(item.workflow_id), { cache: "no-store" });
       if (!resp.ok) return;
       const dto = await resp.json();
+      loadedLibraryDto = dto;
       const wfObj = dto.workflow || dto;
       jsonText = JSON.stringify(wfObj, null, 2);
     }
@@ -934,6 +1100,26 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     dt.items.add(file);
     fileInput.files = dt.files;
     fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+    // Restore the library link (`source`) on the imported workflow so "Update library template..." stays active!
+    if (loadedLibraryDto && loadedLibraryDto.workflow_id) {
+      const linkSource = () => {
+        const adapter = findWorkflowUiAdapter(fileInput);
+        if (!adapter || !adapter.project || !adapter.commands) return;
+        const snap = adapter.project.getSnapshot();
+        if (!snap || !snap.id || !snap.activeWorkflowId) return;
+        adapter.commands.setWorkflowSource(
+          { projectId: snap.id, workflowId: snap.activeWorkflowId },
+          {
+            libraryWorkflowId: loadedLibraryDto.workflow_id,
+            revision: typeof loadedLibraryDto.revision === "number" ? loadedLibraryDto.revision : null,
+            ownerUserId: loadedLibraryDto.user_id
+          }
+        );
+      };
+      window.setTimeout(linkSource, 80);
+      window.setTimeout(linkSource, 250);
+    }
   }
 
   function syncSwitcherSurfaceColor() {
@@ -1393,6 +1579,17 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       );
     });
 
+    const updateYoursBtn = document.createElement("button");
+    updateYoursBtn.type = "button";
+    updateYoursBtn.className = "inv7-wfs-btn";
+    updateYoursBtn.style.borderColor = "rgba(90, 200, 250, 0.45)";
+    updateYoursBtn.style.color = "rgb(147, 226, 255)";
+    updateYoursBtn.title = "Directly update this workflow in 'Your Library' in place (without creating a duplicate copy)";
+    updateYoursBtn.textContent = "💾 Save / Update in Yours";
+    updateYoursBtn.addEventListener("click", () => {
+      saveOrUpdateCurrentWorkflowInYours(hostDiv, updateYoursBtn);
+    });
+
     const rescanBtn = document.createElement("button");
     rescanBtn.type = "button";
     rescanBtn.className = "inv7-wfs-btn";
@@ -1403,6 +1600,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     btnGroup.appendChild(noneBtn);
     btnGroup.appendChild(saveGlobalBtn);
     btnGroup.appendChild(loadGlobalBtn);
+    btnGroup.appendChild(updateYoursBtn);
     btnGroup.appendChild(rescanBtn);
     bulkRow.appendChild(bulkLbl);
     bulkRow.appendChild(btnGroup);
