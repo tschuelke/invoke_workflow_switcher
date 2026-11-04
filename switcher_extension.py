@@ -31,16 +31,21 @@ SWITCHER_FILE_PATH: str = "/workflow-switcher/file"
 SWITCHER_SCRIPT_TAG: bytes = b'<script src="/workflow-switcher.js" defer></script></body>'
 
 
+_IGNORED_SCAN_DIR_NAMES: frozenset[str] = frozenset(
+    {".git", "__pycache__", "node_modules", ".venv", "venv", "tests", "test", "dist", "build", ".mypy_cache", ".pytest_cache"}
+)
+
+
 def get_default_workflow_dirs() -> list[Path]:
-    """Locate `<INVOKE_ROOT>/nodes/*/workflows` and `<INVOKE_ROOT>/workflows` automatically."""
+    """Locate `<INVOKE_ROOT>/nodes/*` and `<INVOKE_ROOT>/workflows` automatically."""
     dirs: list[Path] = []
     try:
         nodes_dir = Path(__file__).resolve().parents[1]
         if nodes_dir.is_dir():
             for child in sorted(nodes_dir.iterdir()):
-                wf_sub = child / "workflows"
-                if wf_sub.is_dir() and wf_sub not in dirs:
-                    dirs.append(wf_sub)
+                if child.is_dir() and not child.name.startswith(".") and child.name not in _IGNORED_SCAN_DIR_NAMES:
+                    if child not in dirs:
+                        dirs.append(child)
         invoke_root = Path(__file__).resolve().parents[2]
         root_wf = invoke_root / "workflows"
         if root_wf.is_dir() and root_wf not in dirs:
@@ -50,11 +55,43 @@ def get_default_workflow_dirs() -> list[Path]:
     return dirs
 
 
+def _iter_workflow_json_files(root_folder: Path) -> list[Path]:
+    """Recursively find `.json` files under `root_folder`, skipping hidden/build/test directories."""
+    found: list[Path] = []
+    try:
+        for json_file in root_folder.rglob("*.json"):
+            try:
+                rel_parts = json_file.relative_to(root_folder).parts[:-1]
+            except ValueError:
+                rel_parts = ()
+            if any(p.startswith(".") or p.lower() in _IGNORED_SCAN_DIR_NAMES for p in rel_parts):
+                continue
+            if json_file.is_file() and not json_file.is_symlink():
+                found.append(json_file)
+    except OSError:
+        pass
+    return sorted(found)
+
+
+def _is_valid_invoke_workflow_dict(data: Any) -> tuple[bool, dict[str, Any]]:
+    """Return `(True, inner_workflow_dict)` only for genuine InvokeAI workflow JSON objects."""
+    if not isinstance(data, dict):
+        return False, {}
+    inner = data.get("workflow", data) if isinstance(data.get("workflow"), dict) else data
+    if not isinstance(inner, dict):
+        return False, {}
+    nodes = inner.get("nodes")
+    edges = inner.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return False, {}
+    return True, inner
+
+
 def scan_workflow_directories(extra_folders: list[str] | None = None) -> list[dict[str, str]]:
-    """Scan default node-pack workflow directories plus any user-supplied folder paths."""
+    """Recursively scan node-pack directories plus any user-supplied folder paths for workflow JSONs."""
     search_dirs: list[tuple[str, Path]] = []
     for d in get_default_workflow_dirs():
-        label = f"Node Pack ({d.parent.name})" if d.parent.name != "workflows" else "InvokeAI Workflows"
+        label = "Node Pack" if d.name != "workflows" else "InvokeAI Workflows"
         search_dirs.append((label, d))
 
     for raw_folder in extra_folders or []:
@@ -63,21 +100,21 @@ def scan_workflow_directories(extra_folders: list[str] | None = None) -> list[di
             continue
         p = Path(cleaned)
         if p.is_dir():
-            search_dirs.append((f"Folder ({p.name})", p))
+            search_dirs.append(("Custom Folder", p))
 
     results: list[dict[str, str]] = []
     seen_paths: set[str] = set()
 
     for source_label, folder in search_dirs:
-        for json_file in sorted(folder.glob("*.json")):
+        for json_file in _iter_workflow_json_files(folder):
             resolved_str = str(json_file.resolve())
             if resolved_str in seen_paths:
                 continue
             try:
                 data = json.loads(json_file.read_text(encoding="utf-8"))
-                if not isinstance(data, dict) or ("nodes" not in data and "workflow" not in data):
+                is_wf, inner = _is_valid_invoke_workflow_dict(data)
+                if not is_wf:
                     continue
-                inner = data.get("workflow", data) if isinstance(data.get("workflow"), dict) else data
                 name = str(inner.get("name") or json_file.stem).strip()
                 desc = str(inner.get("description") or "").strip()
                 raw_tags = str(inner.get("tags") or "").strip()
@@ -131,7 +168,7 @@ def read_workflow_file_bytes(file_path_str: str, extra_folders: list[str] | None
             return None
         raw = resolved.read_bytes()
         parsed = json.loads(raw.decode("utf-8"))
-        if not isinstance(parsed, dict) or ("nodes" not in parsed and "workflow" not in parsed):
+        if not _is_valid_invoke_workflow_dict(parsed)[0]:
             return None
         return raw, resolved.name
     except Exception:
