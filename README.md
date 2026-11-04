@@ -55,7 +55,7 @@ By placing **`⇄ Favorite Workflows`** at the top of each workflow in a group, 
 ## Screenshots & Video Demo
 
 <a href="https://github.com/user-attachments/assets/71404334-4390-4f3c-91e7-d423ef8beb45">
-  <img width="640" alt="Workflow Favorites Switcher Overview (Click to enlarge)" src="https://github.com/user-attachments/assets/71404334-4390-4f3c-91e7-d423ef8beb45" />
+  <img width="450" alt="Workflow Favorites Switcher Overview (Click to enlarge)" src="https://github.com/user-attachments/assets/71404334-4390-4f3c-91e7-d423ef8beb45" />
 </a>
 
 *(Click image to open in full resolution)*
