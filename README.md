@@ -1,4 +1,3 @@
-<img width="1990" height="2480" alt="Workflow Favorites explantion 1" src="https://github.com/user-attachments/assets/aeede5a5-e141-4c68-8876-29d4bb668c90" />
 # `invoke_workflow_switcher` (`⇄ Favorite Workflows`) — Stage & Pipeline Switcher for InvokeAI 7 (`webv2`)
 
 A lightweight, zero-core-patch **Custom Node Pack** for **InvokeAI 7 (`webv2`)** that adds a **`⇄ Favorite Workflows`** form element to the Workflow Form Builder (`Edit` tab) and Form View (`View` tab).
@@ -55,8 +54,7 @@ By placing **`⇄ Favorite Workflows`** at the top of each workflow in a group, 
 
 ## Screenshots & Video Demo
 
-<img width="1990" height="2480" alt="Workflow Favorites explantion 1" src="https://github.com/user-attachments/assets/7900ec5a-f823-4261-a48b-5468ecc28d6c" />
-
+<img width="1605" height="2000" alt="Workflow Favorites kleiner" src="https://github.com/user-attachments/assets/71404334-4390-4f3c-91e7-d423ef8beb45" />
 
 ---
 
