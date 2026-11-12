@@ -1,4 +1,5 @@
-https://github.com/user-attachments/assets/fe99e686-2dae-43a9-a519-0049b8f4675c
+[https://github.com/user-attachments/assets/fe99e686-2dae-43a9-a519-0049b8f4675c](https://github.com/user-attachments/assets/0b997e7f-0159-4e20-857c-f422ae72c0db
+)
 
 # `invoke_workflow_switcher` (`⇄ Favorite Workflows`) — Stage & Pipeline Switcher for InvokeAI 7 (`webv2`)
 
