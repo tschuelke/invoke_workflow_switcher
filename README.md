@@ -35,26 +35,32 @@ By placing **`⇄ Favorite Workflows`** at the top of each workflow in a group, 
 
 ---
 
-## Key Features
+## Key Features (v0.5.0)
 
-- **Per-Workflow Favorites stored in the Workflow JSON:**  
-  Each workflow remembers its own curated list of companion workflows.
-- **Global Favorites Preset (`★ Save to Global` / `↓ Load Global`):**  
-  Set up your favorite stages once and copy them into sibling workflows with a single click.
-- **Direct 1-Click Library Update (`💾 Save / Update in Yours`):**  
-  Update the current workflow directly in **Your Library** in place without creating duplicate copies, while automatically preserving InvokeAI's native library link (`🔗`).
+- **Central Named Workflow Groups (`📁 Group`) + Per-Workflow Overrides:**  
+  Organize your workflows into named pipeline groups (e.g. `LTX 2.5 — Workflows`, `Nano Banana / Cloud`) right from the compact header pill or the `Edit` tab, with live group renaming and automatic strikethrough/cleanup for deleted library workflows.
+- **1-Click Copy & Reset in `Your Library` (`💾` / `🗑 Remove Checked from Yours`):**  
+  Copy checked Node Pack (`file:`) or Built-in (`Browse`) templates into `Yours` with one click (`💾` in `View` or `Edit` mode), update the active workflow in place (`💾 Save / Update in Yours`), or remove checked copies from `Yours` (`🗑 Remove Checked from Yours` in `Edit` mode) to fall back to fresh node-pack templates.
+- **Collapsible Section State Persistence:**  
+  Automatically remembers and restores which collapsible form sections (`type: 'collapsible'`) you expanded or folded across workflow switches.
 - **3 Color-Coded Sources & Multi-Family Filter Chips:**
   - **Your Library (`Yours` — Cyan):** Your saved, fine-tuned personal workflows (default primary source).
   - **`+ Built-in (Browse)` (Lavender/Purple):** Optional toggle to include InvokeAI's built-in default workflows.
   - **`+ Node Pack Templates` (Amber/Gold):** Optional toggle to include factory templates shipped inside custom node packs.
 - **Compact & Collapsible:**  
-  Folds into a single header bar showing the active workflow badge, with a **`Colorized`** toggle (adopts custom accordion/input surface brightness) and an **`Extra Info`** toggle (on-demand **`ⓘ`** button for workflow descriptions).
+  Folds into a single header bar showing the active workflow badge and group selector, with a **`Colorized`** toggle and an **`Extra Info`** toggle (on-demand **`ⓘ`** button for workflow descriptions).
 
 ---
 
 ## Screenshots & Video Demo
 
-*(Add screenshots / video capture here)*
+https://github.com/user-attachments/assets/fe99e686-2dae-43a9-a519-0049b8f4675c
+
+<a href="https://github.com/user-attachments/assets/71404334-4390-4f3c-91e7-d423ef8beb45">
+  <img width="450" alt="Workflow Favorites Switcher Overview (Click to enlarge)" src="https://github.com/user-attachments/assets/71404334-4390-4f3c-91e7-d423ef8beb45" />
+</a>
+
+*(Click image to open in full resolution)*
 
 ---
 
@@ -86,6 +92,24 @@ This extension is a pure Custom Node Pack — **no InvokeAI core or frontend fil
 3. Filter by workflow family chips (e.g. `LTX 2.5`, `OMNI 1.1`, `Nano Banana`), check the workflows that belong to your pipeline, and click **`★ Save to Global`** to reuse the selection in sibling workflows.
 4. Click **`💾 Save / Update in Yours`** to save your workflow in **Your Library** without creating duplicates.
 5. Switch to **View** mode to jump between your pipeline stages with 1 click!
+
+---
+
+## Projects, single-user, multi-user & security hardening (v0.4.0)
+
+**Projects:** InvokeAI 7 opens a library workflow as a *copy inside the current project*. Favorites you tick in project A live in A's copy until you click **`💾 Save / Update in Yours`**; in project B, open (or replace with) the library version to get them.
+
+**Where settings live**
+- *Favorites of a workflow* are stored inside the workflow itself, so they travel with it (export, sharing, node packs).
+- *Global presets* (`★ Save to Global`) are stored in your browser, per InvokeAI address and per user.
+
+**Single-user mode (default):** everything belongs to the built-in admin account and is visible everywhere. Nothing to configure.
+
+**Multi-user mode & Server Security (v0.4.0)**
+- **Authenticated endpoints (`GET` only):** `/workflow-switcher/scan` and `/workflow-switcher/file` authenticate through InvokeAI's `get_current_user_or_default`. You see **Your Library** (your own workflows) plus workflows other users **shared** (green *Shared* tag). Admins additionally see other users' private workflows (*Other User* tag).
+- **Safe saving:** **`Save / Update in Yours`** only ever updates a workflow you own. Saving a shared or foreign workflow creates your own copy, so nobody's original is overwritten.
+- **Zero client path control & opaque file IDs:** Only server-configured workflow folders (`<InvokeAI>/workflows` and `<InvokeAI>/nodes/<pack>`) are scanned. No server filesystem paths are exposed to the browser; templates are referenced exclusively by opaque 16-character SHA-256 IDs (`file:<id>`) against a server-side allowlist.
+- **Resource & event-loop protection:** Directory traversal enforces strict depth (`<= 3`), file count, and pre-read file size (`<= 2 MiB`) limits, caches results in memory, and runs off the ASGI event loop via `asyncio.to_thread`.
 
 ---
 

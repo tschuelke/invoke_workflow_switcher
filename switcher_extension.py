@@ -7,24 +7,49 @@ How it integrates natively into InvokeAI 7's Form Builder (`Edit` tab) and Form 
 2. **In the `Edit` Tab (Form Builder):**
    Clicking `⇄ Workflow Switcher` adds a standard form element carrying a `[workflow-switcher]` marker.
    Inside that movable, deletable Form Builder card, the user can:
-   - Add custom local workflow folders (`+ Add Folder`),
-   - Check (`[x]`) or uncheck which workflows (from Node Packs, the InvokeAI Library, or custom folders)
+   - Check (`[x]`) or uncheck which workflows (from Your Library, Built-in Browse, or Node Pack Templates)
      should be included in this switcher dropdown,
    - Drag the `⇄ Workflow Switcher` card anywhere in the form (e.g. to the very top) or delete it with `×`.
 3. **In the `View` Tab (Daily Use):**
    Where the `[workflow-switcher]` element sits in the form, the user sees ONLY the clean
    **Workflow Switcher Dropdown** showing the checked workflows for instant 1-click switching!
+
+Single- and multi-user mode & Security architecture (v0.4.0):
+- Every API call from the browser carries the signed-in user's Bearer token, so in multi-user mode the
+  library listing and "Save / Update in Yours" act as that user, exactly like InvokeAI's own UI.
+- The listing shows the user's own workflows plus workflows other users shared (`is_public`).
+  Saving only ever updates a workflow the user owns; anything else becomes a new own copy.
+- `/workflow-switcher/scan` and `/workflow-switcher/file` authenticate through InvokeAI's own
+  `get_current_user_or_default` and allow `GET` requests only.
+- Zero client control over filesystem paths: only server-configured workflow directories
+  (`<INVOKE_ROOT>/nodes/<pack>` and `<INVOKE_ROOT>/workflows`) are scanned. Client-supplied `folder` or
+  `path` parameters are never accepted.
+- Zero server path disclosure: `/workflow-switcher/scan` never exposes filesystem paths to the client;
+  discovered templates are referenced exclusively by opaque 16-character SHA-256 IDs (`file:<id>`)
+  resolved against a server-maintained allowlist.
+- Strict traversal & resource bounds: directory scanning uses bounded depth (`MAX_SCAN_DEPTH = 3`),
+  skips symlinks, enforces a pre-read file size cap (`MAX_WORKFLOW_FILE_BYTES = 2 MiB`) and file count
+  limits, caches results in memory (`SCAN_CACHE_TTL_SECONDS = 5.0`), and runs off the ASGI event loop
+  via `asyncio.to_thread`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
+import re
 import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
+SWITCHER_VERSION: str = "0.5.0"
 SWITCHER_SCRIPT_PATH: str = "/workflow-switcher.js"
 SWITCHER_SCAN_PATH: str = "/workflow-switcher/scan"
 SWITCHER_FILE_PATH: str = "/workflow-switcher/file"
@@ -32,45 +57,132 @@ SWITCHER_SCRIPT_TAG: bytes = b'<script src="/workflow-switcher.js" defer></scrip
 
 
 _IGNORED_SCAN_DIR_NAMES: frozenset[str] = frozenset(
-    {".git", "__pycache__", "node_modules", ".venv", "venv", "tests", "test", "dist", "build", ".mypy_cache", ".pytest_cache"}
+    {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        "tests",
+        "test",
+        "dist",
+        "build",
+        ".mypy_cache",
+        ".pytest_cache",
+        "models",
+        "assets",
+        "overlays",
+        "tools",
+    }
 )
+# Hard resource bounds for server-side node-pack workflow discovery:
+MAX_SCAN_DEPTH: int = 3
+MAX_WORKFLOW_FILE_BYTES: int = 2 * 1024 * 1024  # 2 MiB cap checked via stat() before reading
+MAX_JSON_FILES_PER_FOLDER: int = 200
+MAX_TOTAL_SCANNED_FILES: int = 500
+MAX_VISITED_ENTRIES: int = 5000
+SCAN_CACHE_TTL_SECONDS: float = 5.0
+_OPAQUE_FILE_ID_RE: re.Pattern[str] = re.compile(r"^[0-9a-f]{16}$")
+
+_SCAN_LOCK = threading.RLock()
+_DISCOVERED_WORKFLOW_ALLOWLIST: dict[str, Path] = {}
+_CACHED_SCAN_ITEMS: list[dict[str, Any]] | None = None
+_CACHED_SCAN_TIMESTAMP: float = 0.0
+_CACHED_SCAN_ROOTS_KEY: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SwitcherRequestUser:
+    """Who is asking, as InvokeAI's own authentication sees it."""
+
+    user_id: str
+    is_admin: bool
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    """Return True if `path` is a symlink or a Windows NTFS junction point."""
+    try:
+        if path.is_symlink():
+            return True
+        is_junc = getattr(path, "is_junction", None)
+        if callable(is_junc) and bool(is_junc()):
+            return True
+    except OSError:
+        return True
+    return False
+
+
+def _is_within_allowed_roots(resolved_path: Path, allowed_roots: list[Path]) -> bool:
+    """Return True only when `resolved_path` resides inside at least one of `allowed_roots`."""
+    return any(resolved_path.is_relative_to(root) for root in allowed_roots)
 
 
 def get_default_workflow_dirs() -> list[Path]:
-    """Locate `<INVOKE_ROOT>/nodes/*` and `<INVOKE_ROOT>/workflows` automatically."""
+    """Locate server-configured `<INVOKE_ROOT>/nodes/*` and `<INVOKE_ROOT>/workflows` directories."""
     dirs: list[Path] = []
     try:
         nodes_dir = Path(__file__).resolve().parents[1]
-        if nodes_dir.is_dir():
+        if nodes_dir.is_dir() and not _is_symlink_or_junction(nodes_dir):
             for child in sorted(nodes_dir.iterdir()):
-                if child.is_dir() and not child.name.startswith(".") and child.name not in _IGNORED_SCAN_DIR_NAMES:
+                if (
+                    child.is_dir()
+                    and not _is_symlink_or_junction(child)
+                    and not child.name.startswith(".")
+                    and child.name.lower() not in _IGNORED_SCAN_DIR_NAMES
+                ):
                     if child not in dirs:
                         dirs.append(child)
         invoke_root = Path(__file__).resolve().parents[2]
         root_wf = invoke_root / "workflows"
-        if root_wf.is_dir() and root_wf not in dirs:
+        if root_wf.is_dir() and not _is_symlink_or_junction(root_wf) and root_wf not in dirs:
             dirs.append(root_wf)
     except IndexError:
         pass
     return dirs
 
 
-def _iter_workflow_json_files(root_folder: Path) -> list[Path]:
-    """Recursively find `.json` files under `root_folder`, skipping hidden/build/test directories."""
+def _compute_workflow_file_id(resolved_path: Path) -> str:
+    """Return a deterministic, opaque 16-hex-char identifier for a resolved server workflow path."""
+    return hashlib.sha256(str(resolved_path).encode("utf-8")).hexdigest()[:16]
+
+
+def _iter_workflow_json_files(root_folder: Path, *, max_depth: int = MAX_SCAN_DEPTH) -> list[Path]:
+    """Traverse `root_folder` up to `max_depth` levels for `.json` files within size/count limits."""
     found: list[Path] = []
-    try:
-        for json_file in root_folder.rglob("*.json"):
-            try:
-                rel_parts = json_file.relative_to(root_folder).parts[:-1]
-            except ValueError:
-                rel_parts = ()
-            if any(p.startswith(".") or p.lower() in _IGNORED_SCAN_DIR_NAMES for p in rel_parts):
+    if not root_folder.is_dir() or _is_symlink_or_junction(root_folder):
+        return found
+
+    queue: deque[tuple[Path, int]] = deque([(root_folder, 0)])
+    visited_entries = 0
+    while queue and len(found) < MAX_JSON_FILES_PER_FOLDER and visited_entries < MAX_VISITED_ENTRIES:
+        current_dir, depth = queue.popleft()
+        try:
+            entries = sorted(current_dir.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+
+        for entry in entries:
+            visited_entries += 1
+            if visited_entries > MAX_VISITED_ENTRIES:
+                break
+            if entry.name.startswith("."):
                 continue
-            if json_file.is_file() and not json_file.is_symlink():
-                found.append(json_file)
-    except OSError:
-        pass
-    return sorted(found)
+            try:
+                if _is_symlink_or_junction(entry):
+                    continue
+                if entry.is_dir():
+                    if depth < max_depth and entry.name.lower() not in _IGNORED_SCAN_DIR_NAMES:
+                        queue.append((entry, depth + 1))
+                elif entry.is_file() and entry.suffix.lower() == ".json":
+                    st = entry.stat()
+                    if 0 < st.st_size <= MAX_WORKFLOW_FILE_BYTES:
+                        found.append(entry)
+                        if len(found) >= MAX_JSON_FILES_PER_FOLDER:
+                            break
+            except OSError:
+                continue
+
+    return found
 
 
 def _is_valid_invoke_workflow_dict(data: Any) -> tuple[bool, dict[str, Any]]:
@@ -87,84 +199,131 @@ def _is_valid_invoke_workflow_dict(data: Any) -> tuple[bool, dict[str, Any]]:
     return True, inner
 
 
-def scan_workflow_directories(extra_folders: list[str] | None = None) -> list[dict[str, str]]:
-    """Recursively scan node-pack directories plus any user-supplied folder paths for workflow JSONs."""
-    search_dirs: list[tuple[str, Path]] = []
-    for d in get_default_workflow_dirs():
-        label = "Node Pack" if d.name != "workflows" else "InvokeAI Workflows"
-        search_dirs.append((label, d))
+def invalidate_workflow_scan_cache() -> None:
+    """Clear the in-memory workflow scan cache and allowlist."""
+    global _CACHED_SCAN_ITEMS, _CACHED_SCAN_TIMESTAMP, _CACHED_SCAN_ROOTS_KEY
+    with _SCAN_LOCK:
+        _CACHED_SCAN_ITEMS = None
+        _CACHED_SCAN_TIMESTAMP = 0.0
+        _CACHED_SCAN_ROOTS_KEY = ()
+        _DISCOVERED_WORKFLOW_ALLOWLIST.clear()
 
-    for raw_folder in extra_folders or []:
-        cleaned = raw_folder.strip().strip('"').strip("'")
-        if not cleaned:
-            continue
-        p = Path(cleaned)
-        if p.is_dir():
-            search_dirs.append(("Custom Folder", p))
 
-    results: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
+def scan_workflow_directories(*, use_cache: bool = False) -> list[dict[str, Any]]:
+    """Scan server-configured workflow directories and populate the server-side file allowlist."""
+    global _CACHED_SCAN_ITEMS, _CACHED_SCAN_TIMESTAMP, _CACHED_SCAN_ROOTS_KEY
 
-    for source_label, folder in search_dirs:
-        for json_file in _iter_workflow_json_files(folder):
-            resolved_str = str(json_file.resolve())
-            if resolved_str in seen_paths:
-                continue
-            try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-                is_wf, inner = _is_valid_invoke_workflow_dict(data)
-                if not is_wf:
+    with _SCAN_LOCK:
+        default_dirs = get_default_workflow_dirs()
+        roots_key = tuple(str(d) for d in default_dirs)
+        now = time.monotonic()
+        if (
+            use_cache
+            and _CACHED_SCAN_ITEMS is not None
+            and _CACHED_SCAN_ROOTS_KEY == roots_key
+            and (now - _CACHED_SCAN_TIMESTAMP) < SCAN_CACHE_TTL_SECONDS
+        ):
+            return [dict(item) for item in _CACHED_SCAN_ITEMS]
+
+        allowed_roots = [d.resolve() for d in default_dirs]
+        search_dirs: list[tuple[str, Path]] = []
+        for d in default_dirs:
+            label = "Node Pack" if d.name != "workflows" else "InvokeAI Workflows"
+            search_dirs.append((label, d))
+
+        results: list[dict[str, Any]] = []
+        new_allowlist: dict[str, Path] = {}
+        seen_paths: set[str] = set()
+
+        for source_label, folder in search_dirs:
+            if len(results) >= MAX_TOTAL_SCANNED_FILES:
+                break
+            for json_file in _iter_workflow_json_files(folder):
+                if len(results) >= MAX_TOTAL_SCANNED_FILES:
+                    break
+                if json_file.name.endswith("(PoC).json"):
                     continue
-                name = str(inner.get("name") or json_file.stem).strip()
-                desc = str(inner.get("description") or "").strip()
-                raw_tags = str(inner.get("tags") or "").strip()
-                tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
-                headings: list[str] = []
-                form_obj = inner.get("form")
-                if isinstance(form_obj, dict) and isinstance(form_obj.get("elements"), dict):
-                    for el in form_obj["elements"].values():
-                        if isinstance(el, dict) and el.get("type") == "heading":
-                            el_data = el.get("data")
-                            if isinstance(el_data, dict):
-                                h_text = str(el_data.get("content") or "").strip()
-                                if h_text:
-                                    headings.append(h_text.lower())
-                seen_paths.add(resolved_str)
-                results.append(
-                    {
-                        "id": f"file:{resolved_str}",
-                        "name": name,
-                        "description": desc,
-                        "tags": tags,
-                        "headings": headings,
-                        "source": source_label,
-                        "path": resolved_str,
-                        "filename": json_file.name,
-                    }
-                )
-            except Exception:
-                continue
+                try:
+                    resolved = json_file.resolve()
+                    if not _is_within_allowed_roots(resolved, allowed_roots):
+                        continue
+                    resolved_str = str(resolved)
+                    if resolved_str in seen_paths:
+                        continue
+                    st = resolved.stat()
+                    if st.st_size <= 0 or st.st_size > MAX_WORKFLOW_FILE_BYTES:
+                        continue
+                    data = json.loads(resolved.read_text(encoding="utf-8"))
+                    is_wf, inner = _is_valid_invoke_workflow_dict(data)
+                    if not is_wf:
+                        continue
+                    name = str(inner.get("name") or json_file.stem).strip()
+                    desc = str(inner.get("description") or "").strip()
+                    raw_tags = str(inner.get("tags") or "").strip()
+                    tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+                    headings: list[str] = []
+                    form_obj = inner.get("form")
+                    if isinstance(form_obj, dict) and isinstance(form_obj.get("elements"), dict):
+                        for el in form_obj["elements"].values():
+                            if isinstance(el, dict) and el.get("type") in ("heading", "collapsible"):
+                                el_data = el.get("data")
+                                if isinstance(el_data, dict):
+                                    h_text = str(el_data.get("content") or "").strip()
+                                    if h_text:
+                                        headings.append(h_text.lower())
+                    file_id = _compute_workflow_file_id(resolved)
+                    seen_paths.add(resolved_str)
+                    new_allowlist[file_id] = resolved
+                    results.append(
+                        {
+                            "id": f"file:{file_id}",
+                            "file_id": file_id,
+                            "name": name,
+                            "description": desc,
+                            "tags": tags,
+                            "headings": headings,
+                            "source": source_label,
+                            "filename": json_file.name,
+                        }
+                    )
+                except Exception:
+                    continue
 
-    results.sort(key=lambda item: (item["source"].lower(), item["name"].lower()))
-    return results
+        results.sort(key=lambda item: (str(item["source"]).lower(), str(item["name"]).lower()))
+        _DISCOVERED_WORKFLOW_ALLOWLIST.clear()
+        _DISCOVERED_WORKFLOW_ALLOWLIST.update(new_allowlist)
+        _CACHED_SCAN_ITEMS = [dict(item) for item in results]
+        _CACHED_SCAN_TIMESTAMP = time.monotonic()
+        _CACHED_SCAN_ROOTS_KEY = roots_key
+        return results
 
 
-def read_workflow_file_bytes(file_path_str: str, extra_folders: list[str] | None = None) -> tuple[bytes, str] | None:
-    """Safely read a discovered `.json` workflow file from disk and return `(bytes, filename)`."""
-    cleaned = unquote(file_path_str).strip()
-    if not cleaned:
+def read_workflow_file_bytes(file_id: str) -> tuple[bytes, str] | None:
+    """Safely read a server-allowlisted workflow JSON file by its opaque `file_id`."""
+    cleaned_id = unquote(file_id or "").strip().lower()
+    if cleaned_id.startswith("file:"):
+        cleaned_id = cleaned_id[5:]
+    if not _OPAQUE_FILE_ID_RE.fullmatch(cleaned_id):
         return None
-    candidate = Path(cleaned)
-    if candidate.is_symlink() or candidate.suffix.lower() != ".json" or not candidate.is_file():
+
+    with _SCAN_LOCK:
+        candidate = _DISCOVERED_WORKFLOW_ALLOWLIST.get(cleaned_id)
+        if candidate is None:
+            scan_workflow_directories(use_cache=True)
+            candidate = _DISCOVERED_WORKFLOW_ALLOWLIST.get(cleaned_id)
+    if candidate is None:
         return None
+
     try:
+        if _is_symlink_or_junction(candidate) or candidate.suffix.lower() != ".json" or not candidate.is_file():
+            return None
         resolved = candidate.resolve()
         allowed_roots = [d.resolve() for d in get_default_workflow_dirs()]
-        for raw_folder in extra_folders or []:
-            folder_clean = raw_folder.strip().strip('"').strip("'")
-            if folder_clean and Path(folder_clean).is_dir():
-                allowed_roots.append(Path(folder_clean).resolve())
-        if allowed_roots and not any(resolved.is_relative_to(root) for root in allowed_roots):
+        # No allowed root means nothing may be read (fail closed).
+        if not _is_within_allowed_roots(resolved, allowed_roots):
+            return None
+        st = resolved.stat()
+        if st.st_size <= 0 or st.st_size > MAX_WORKFLOW_FILE_BYTES:
             return None
         raw = resolved.read_bytes()
         parsed = json.loads(raw.decode("utf-8"))
@@ -193,7 +352,9 @@ def install_workflow_switcher_extension(target_app: Any | None = None, logger: l
     setattr(app, "_invoke_workflow_switcher_installed", True)
 
     log = logger or logging.getLogger("InvokeAI")
-    log.info("Loaded invoke_workflow_switcher v0.2.0 (+ Add form element -> Workflow Switcher with Collapsible toggle)")
+    log.info(
+        f"Loaded invoke_workflow_switcher v{SWITCHER_VERSION} (+ Add form element -> Workflow Switcher with Collapsible toggle)"
+    )
     return True
 
 
@@ -211,25 +372,32 @@ class _WorkflowSwitcherASGIWrapper:
             return
 
         path: str = scope.get("path", "/") or "/"
+        method: str = str(scope.get("method", "GET") or "GET").upper()
         query_string: str = (scope.get("query_string") or b"").decode("utf-8", errors="ignore")
 
         if path == SWITCHER_SCRIPT_PATH or path.endswith("/workflow-switcher.js"):
+            if method != "GET":
+                await _send_response(send, b'{"error":"Method not allowed"}', b"application/json", status=405)
+                return
             await _send_response(send, _WORKFLOW_SWITCHER_JS_BYTES, b"application/javascript; charset=utf-8")
             return
 
-        if path == SWITCHER_SCAN_PATH:
+        if path in (SWITCHER_SCAN_PATH, SWITCHER_FILE_PATH):
+            if method != "GET":
+                await _send_response(send, b'{"error":"Method not allowed"}', b"application/json", status=405)
+                return
+            user = resolve_request_user(scope)
+            if user is None:
+                await _send_response(send, b'{"error":"Authentication required"}', b"application/json", status=401)
+                return
+            if path == SWITCHER_SCAN_PATH:
+                items = await asyncio.to_thread(scan_workflow_directories, use_cache=True)
+                payload = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
+                await _send_response(send, payload, b"application/json; charset=utf-8")
+                return
             params = parse_qs(query_string)
-            folders = params.get("folder", [])
-            items = scan_workflow_directories(extra_folders=folders)
-            payload = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
-            await _send_response(send, payload, b"application/json; charset=utf-8")
-            return
-
-        if path == SWITCHER_FILE_PATH:
-            params = parse_qs(query_string)
-            target = (params.get("path") or [""])[0]
-            folders = params.get("folder", [])
-            res = read_workflow_file_bytes(target, extra_folders=folders)
+            target_id = (params.get("id") or [""])[0]
+            res = await asyncio.to_thread(read_workflow_file_bytes, target_id)
             if res is not None:
                 raw_bytes, _fname = res
                 await _send_response(send, raw_bytes, b"application/json; charset=utf-8")
@@ -271,6 +439,53 @@ class _WorkflowSwitcherASGIWrapper:
         await self.inner_app(scope, receive, capture_send)
 
 
+def resolve_request_user(scope: dict[str, Any]) -> SwitcherRequestUser | None:
+    """Authenticate a raw ASGI request exactly like InvokeAI's REST routes do.
+
+    Delegates to InvokeAI's `get_current_user_or_default`: in single-user mode that is always the admin
+    `system`; in multi-user mode the Bearer token must belong to an existing, active, non-revoked account.
+    Returns None when the request is not authorized. Fails closed in multi-user mode if InvokeAI's
+    authentication cannot be imported.
+    """
+    token = _bearer_token_from_scope(scope)
+    try:
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        from invokeai.app.api.auth_dependencies import get_current_user_or_default
+    except ImportError:
+        return _fallback_user_without_auth_module()
+
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token) if token else None
+    try:
+        token_data = get_current_user_or_default(credentials)
+    except HTTPException:
+        return None
+    except Exception:
+        return None
+    return SwitcherRequestUser(user_id=str(token_data.user_id), is_admin=bool(token_data.is_admin))
+
+
+def _bearer_token_from_scope(scope: dict[str, Any]) -> str | None:
+    for name, value in scope.get("headers") or []:
+        if name.lower() == b"authorization":
+            scheme, _, token = value.decode("latin-1").partition(" ")
+            if scheme.lower() == "bearer" and token.strip():
+                return token.strip()
+    return None
+
+
+def _fallback_user_without_auth_module() -> SwitcherRequestUser | None:
+    """Without InvokeAI's auth module only single-user mode can be trusted."""
+    try:
+        from invokeai.app.services.config.config_default import get_config
+
+        multiuser = bool(getattr(get_config(), "multiuser", False))
+    except Exception:
+        return None
+    return None if multiuser else SwitcherRequestUser(user_id="system", is_admin=True)
+
+
 def _resolve_invoke_fastapi_app() -> Any | None:
     api_app_mod = sys.modules.get("invokeai.app.api_app")
     if api_app_mod is not None and hasattr(api_app_mod, "app"):
@@ -306,7 +521,11 @@ _WORKFLOW_SWITCHER_JS: str = r"""
   if (window.__invoke7WorkflowSwitcherLoaded) return;
   window.__invoke7WorkflowSwitcherLoaded = true;
 
-  const STORAGE_KEY = "invoke7_workflow_switcher_config_v2";
+  // Presets are kept per user id; the pre-0.3.0 shared key only seeds a user's first load.
+  const STORAGE_KEY_BASE = "invoke7_workflow_switcher_config_v2";
+  // Where InvokeAI 7's webv2 keeps the signed-in user's JWT (features/identity/core/tokenStorage.ts).
+  const AUTH_TOKEN_STORAGE_KEY = "auth_token";
+  const SINGLE_USER_ID = "system";
   const MARKER_PREFIX = "[workflow-switcher";
   const MARKER_DEFAULT = "[workflow-switcher]";
 
@@ -315,47 +534,178 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     return t === "[workflow-switcher]" || t.startsWith("[workflow-switcher:") || t.startsWith("[workflow-switcher]");
   }
 
+  function readAuthToken() {
+    try {
+      return window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Same credential InvokeAI's own UI sends; in single-user mode there is no token and none is needed.
+  function apiFetch(url, init) {
+    const options = { cache: "no-store", ...(init || {}) };
+    const headers = new Headers(options.headers || {});
+    const token = readAuthToken();
+    if (token && !headers.has("Authorization")) headers.set("Authorization", "Bearer " + token);
+    return fetch(url, { ...options, headers });
+  }
+
+  // Display/ownership hint only; the server enforces every permission itself.
+  function currentUserId() {
+    const token = readAuthToken();
+    if (!token) return SINGLE_USER_ID;
+    try {
+      const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const binary = atob(payload.padEnd(payload.length + ((4 - (payload.length % 4)) % 4), "="));
+      const claims = JSON.parse(new TextDecoder().decode(Uint8Array.from(binary, (c) => c.charCodeAt(0))));
+      return String(claims.user_id || SINGLE_USER_ID);
+    } catch (_) {
+      return SINGLE_USER_ID;
+    }
+  }
+
+  function storageKeyForCurrentUser() {
+    return STORAGE_KEY_BASE + ":" + currentUserId();
+  }
+
+  function createWorkflowGroup(name, overrides) {
+    const cleanName = String(name || "Default Group").trim() || "Default Group";
+    const id =
+      (overrides && overrides.id) ||
+      "grp_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+    const normalizedLabels = {};
+    if (overrides && overrides.favoriteLabels && typeof overrides.favoriteLabels === "object") {
+      for (const [k, v] of Object.entries(overrides.favoriteLabels)) {
+        const cleanKey = String(k || "").trim().toLowerCase();
+        if (cleanKey && v) {
+          normalizedLabels[cleanKey] = String(v);
+        }
+      }
+    }
+    return {
+      id: String(id),
+      name: cleanName,
+      favorites:
+        overrides && Array.isArray(overrides.favorites)
+          ? Array.from(new Set(overrides.favorites.map((f) => String(f).trim().toLowerCase()).filter(Boolean)))
+          : [],
+      favoriteLabels: normalizedLabels,
+      activeTags:
+        overrides && Array.isArray(overrides.activeTags)
+          ? overrides.activeTags.map((t) => String(t).toLowerCase())
+          : [],
+      includeNodePacks: Boolean(overrides && overrides.includeNodePacks),
+      includeBrowse: Boolean(overrides && overrides.includeBrowse)
+    };
+  }
+
+  function normalizeGroupsConfig(parsed) {
+    const src = parsed && typeof parsed === "object" ? parsed : {};
+    let groups = [];
+    const seenIds = new Set();
+    if (Array.isArray(src.groups) && src.groups.length > 0) {
+      for (let idx = 0; idx < src.groups.length; idx++) {
+        const g = src.groups[idx];
+        if (!g || typeof g !== "object") continue;
+        const candidate = createWorkflowGroup(g.name || "Group " + (idx + 1), g);
+        if (seenIds.has(candidate.id)) continue;
+        seenIds.add(candidate.id);
+        groups.push(candidate);
+      }
+    }
+    if (groups.length === 0) {
+      const hasLegacyV4 =
+        Array.isArray(src.globalFavorites) ||
+        Array.isArray(src.globalActiveTags) ||
+        typeof src.globalIncludeNodePacks === "boolean" ||
+        typeof src.globalIncludeBrowse === "boolean";
+      if (hasLegacyV4) {
+        groups = [
+          createWorkflowGroup("Default Group", {
+            id: "grp_default",
+            favorites: Array.isArray(src.globalFavorites) ? src.globalFavorites : [],
+            favoriteLabels: src.favoriteLabels || {},
+            activeTags: Array.isArray(src.globalActiveTags) ? src.globalActiveTags : [],
+            includeNodePacks: Boolean(src.globalIncludeNodePacks),
+            includeBrowse: Boolean(src.globalIncludeBrowse)
+          })
+        ];
+      } else {
+        // Fresh start: empty Default Group (no pre-populated foreign workflows).
+        groups = [createWorkflowGroup("Default Group", { id: "grp_default" })];
+      }
+    }
+    const requestedActiveId = typeof src.activeGroupId === "string" ? src.activeGroupId : "";
+    const activeGroup = groups.find((g) => g.id === requestedActiveId) || groups[0];
+    return {
+      groups: groups,
+      activeGroupId: activeGroup.id,
+      savedSectionsByWorkflow:
+        src.savedSectionsByWorkflow && typeof src.savedSectionsByWorkflow === "object"
+          ? src.savedSectionsByWorkflow
+          : {},
+      collapsedInView: Boolean(src.collapsedInView)
+    };
+  }
+
   function loadConfig() {
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
+      const raw =
+        window.localStorage.getItem(storageKeyForCurrentUser()) || window.localStorage.getItem(STORAGE_KEY_BASE);
       if (raw) {
-        const parsed = JSON.parse(raw);
-        return {
-          customFolders: Array.isArray(parsed.customFolders) ? parsed.customFolders : [],
-          globalFavorites: Array.isArray(parsed.globalFavorites) ? parsed.globalFavorites : [],
-          globalActiveTags: Array.isArray(parsed.globalActiveTags)
-            ? parsed.globalActiveTags.map((t) => String(t).toLowerCase())
-            : [],
-          globalIncludeNodePacks: Boolean(parsed.globalIncludeNodePacks),
-          globalIncludeBrowse: Boolean(parsed.globalIncludeBrowse),
-          savedSectionsByWorkflow:
-            parsed.savedSectionsByWorkflow && typeof parsed.savedSectionsByWorkflow === "object"
-              ? parsed.savedSectionsByWorkflow
-              : {},
-          collapsedInView: Boolean(parsed.collapsedInView)
-        };
+        return normalizeGroupsConfig(JSON.parse(raw));
       }
     } catch (_) {}
-    return {
-      customFolders: [],
-      globalFavorites: [],
-      globalActiveTags: [],
-      globalIncludeNodePacks: false,
-      globalIncludeBrowse: false,
-      savedSectionsByWorkflow: {},
-      collapsedInView: false
-    };
+    return normalizeGroupsConfig(null);
   }
 
   function saveConfig(cfg) {
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+      window.localStorage.setItem(storageKeyForCurrentUser(), JSON.stringify(cfg));
     } catch (_) {}
   }
 
   let switcherConfig = loadConfig();
+  let switcherConfigUserId = currentUserId();
+
+  // Another account signed in within this tab: switch to that user's presets.
+  function reloadConfigIfUserChanged() {
+    const userId = currentUserId();
+    if (userId === switcherConfigUserId) return false;
+    switcherConfig = loadConfig();
+    switcherConfigUserId = userId;
+    return true;
+  }
+
+  function getActiveGroup() {
+    if (!Array.isArray(switcherConfig.groups) || switcherConfig.groups.length === 0) {
+      switcherConfig = normalizeGroupsConfig(switcherConfig);
+    }
+    return (
+      switcherConfig.groups.find((g) => g.id === switcherConfig.activeGroupId) || switcherConfig.groups[0]
+    );
+  }
+
+  function updateGroupById(groupId, patch) {
+    if (reloadConfigIfUserChanged()) return null;
+    const target = switcherConfig.groups.find((g) => g.id === groupId);
+    if (!target) return null;
+    const updated = createWorkflowGroup(
+      patch && typeof patch.name === "string" ? patch.name : target.name,
+      { ...target, ...(patch || {}), id: target.id }
+    );
+    switcherConfig.groups = switcherConfig.groups.map((g) => (g.id === target.id ? updated : g));
+    saveConfig(switcherConfig);
+    return updated;
+  }
+
   let allDiscoveredWorkflows = [];
-  let scanInFlight = false;
+  let hasCompletedInitialScan = false;
+  let lastScanFinishedAt = 0;
+  let lastScanStatus = { lib: false, browse: false, pack: false };
+  let activeScanPromise = null;
+  let pendingRehydrateAfterSelect = false;
   let pendingStampNewTextElement = false;
   let knownFormTextareas = new Set();
 
@@ -370,14 +720,101 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     return kind + name;
   }
 
+  function humanizeFavoriteKey(favKey, favoriteLabels) {
+    const cleanKey = String(favKey || "").trim().toLowerCase();
+    if (favoriteLabels && typeof favoriteLabels === "object") {
+      if (favoriteLabels[cleanKey]) return String(favoriteLabels[cleanKey]);
+      if (favoriteLabels[favKey]) return String(favoriteLabels[favKey]);
+    }
+    const raw = String(favKey || "").trim();
+    const colonIdx = raw.indexOf(":");
+    const stripped = colonIdx !== -1 ? raw.slice(colonIdx + 1).trim() : raw;
+    return stripped || raw;
+  }
+
+  function findMissingFavoritesForGroup(group, discoveredWorkflows, scanStatus) {
+    if (!group || !Array.isArray(group.favorites) || group.favorites.length === 0) {
+      return [];
+    }
+    const status =
+      scanStatus && typeof scanStatus === "object"
+        ? scanStatus
+        : { lib: true, browse: true, pack: true };
+    const list = Array.isArray(discoveredWorkflows) ? discoveredWorkflows : [];
+    const presentKeys = new Set();
+    const presentLibNames = new Set();
+    const presentAllNames = new Set();
+    for (const item of list) {
+      const itemKey = getItemFavoriteKey(item);
+      presentKeys.add(itemKey);
+      const nm = ((item && item.name) || "").trim().toLowerCase();
+      if (nm) {
+        presentAllNames.add(nm);
+        if (itemKey.startsWith("lib:")) {
+          presentLibNames.add(nm);
+        }
+      }
+    }
+    const missing = [];
+    const seen = new Set();
+    for (const favKey of group.favorites) {
+      const k = String(favKey || "").trim().toLowerCase();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      const colonIdx = k.indexOf(":");
+      const prefix = colonIdx !== -1 ? k.slice(0, colonIdx) : "";
+      const namePart = colonIdx !== -1 ? k.slice(colonIdx + 1).trim() : k;
+      const sourceKind = prefix === "pack" ? "pack" : prefix === "browse" ? "browse" : "lib";
+
+      // Only report a workflow as missing when its source endpoint completed without error:
+      if (sourceKind === "lib" && !status.lib) continue;
+      if (sourceKind === "browse" && !status.browse) continue;
+      if (sourceKind === "pack" && !status.pack) continue;
+
+      if (prefix === "lib") {
+        if (presentKeys.has(k)) continue;
+        // If the user deleted their Library copy of a Node Pack workflow while Node Pack Templates are enabled
+        // in this group, the workflow seamlessly falls back to the yellow Node Pack template instead of missing:
+        if (group.includeNodePacks && namePart && presentKeys.has("pack:" + namePart) && status.pack) continue;
+        if (group.includeBrowse && namePart && presentKeys.has("browse:" + namePart) && status.browse) continue;
+      } else if (prefix === "browse" || prefix === "pack") {
+        // When a user saves a Browse or Node Pack workflow to Your Library, refreshAllWorkflows deduplicates it
+        // in favour of the `lib:` entry; treat it as present if either the original key or `lib:<name>` exists.
+        if (presentKeys.has(k) || (namePart && presentLibNames.has(namePart) && status.lib)) continue;
+      } else {
+        // Legacy unprefixed entry:
+        if (namePart && presentAllNames.has(namePart)) continue;
+      }
+
+      missing.push({
+        key: k,
+        label: humanizeFavoriteKey(k, group.favoriteLabels),
+        sourceKind: sourceKind
+      });
+    }
+    return missing;
+  }
+
+  function removeMissingFavoritesFromGroup(group, discoveredWorkflows, scanStatus) {
+    const missing = findMissingFavoritesForGroup(group, discoveredWorkflows, scanStatus);
+    if (missing.length === 0) return group;
+    const missingKeySet = new Set(missing.map((m) => m.key));
+    const nextFavs = (group.favorites || []).filter((k) => !missingKeySet.has(String(k).trim().toLowerCase()));
+    const nextLabels = { ...(group.favoriteLabels || {}) };
+    for (const mKey of missingKeySet) {
+      delete nextLabels[mKey];
+    }
+    return createWorkflowGroup(group.name, {
+      ...group,
+      favorites: nextFavs,
+      favoriteLabels: nextLabels
+    });
+  }
+
   function createInitialMarkerStateFromGlobal() {
     return {
       colorized: true,
-      showInfo: false,
-      includeNodePacks: Boolean(switcherConfig.globalIncludeNodePacks),
-      includeBrowse: Boolean(switcherConfig.globalIncludeBrowse),
-      activeTags: Array.isArray(switcherConfig.globalActiveTags) ? [...switcherConfig.globalActiveTags] : [],
-      favorites: Array.isArray(switcherConfig.globalFavorites) ? [...switcherConfig.globalFavorites] : []
+      showInfo: false
     };
   }
 
@@ -390,15 +827,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
         if (parsed && typeof parsed === "object") {
           return {
             colorized: parsed.colorized !== false,
-            showInfo: Boolean(parsed.showInfo),
-            includeNodePacks: Boolean(parsed.includeNodePacks),
-            includeBrowse: Boolean(parsed.includeBrowse),
-            activeTags: Array.isArray(parsed.activeTags)
-              ? parsed.activeTags.map((t) => String(t).toLowerCase())
-              : [],
-            favorites: Array.isArray(parsed.favorites)
-              ? parsed.favorites.map((f) => String(f).trim().toLowerCase()).filter(Boolean)
-              : []
+            showInfo: Boolean(parsed.showInfo)
           };
         }
       } catch (_) {}
@@ -406,9 +835,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     const lower = raw.toLowerCase();
     const hasPlain = lower.includes("plain") || raw.includes("nocolor");
     const hasInfo = lower.includes("info") || lower.includes("desc");
-    const base = createInitialMarkerStateFromGlobal();
     return {
-      ...base,
       colorized: !hasPlain,
       showInfo: hasInfo
     };
@@ -417,22 +844,70 @@ _WORKFLOW_SWITCHER_JS: str = r"""
   function formatWorkflowMarkerState(state) {
     const clean = {
       colorized: state.colorized !== false,
-      showInfo: Boolean(state.showInfo),
-      includeNodePacks: Boolean(state.includeNodePacks),
-      includeBrowse: Boolean(state.includeBrowse),
-      activeTags: Array.isArray(state.activeTags) ? state.activeTags : [],
-      favorites: Array.isArray(state.favorites) ? state.favorites : []
+      showInfo: Boolean(state.showInfo)
     };
     return MARKER_DEFAULT + JSON.stringify(clean);
   }
 
-  function isItemFavoritedInState(wfState, item) {
-    if (!wfState || !Array.isArray(wfState.favorites) || wfState.favorites.length === 0) {
+  function isItemFavoritedInGroup(group, item) {
+    if (!group || !Array.isArray(group.favorites) || group.favorites.length === 0) {
       return false;
     }
     const key = getItemFavoriteKey(item);
     const nameOnly = ((item && item.name) || "").trim().toLowerCase();
-    return wfState.favorites.includes(key) || wfState.favorites.includes(nameOnly);
+    if (group.favorites.includes(key) || (nameOnly && group.favorites.includes(nameOnly))) {
+      return true;
+    }
+    if (!nameOnly) return false;
+    // Seamless transition when a yellow Node Pack (`pack:`) or purple Browse (`browse:`) workflow is copied/saved
+    // into Your Library (`lib:`): it stays checked in the group and automatically switches to the white Library entry!
+    if (key.startsWith("lib:")) {
+      return group.favorites.includes("pack:" + nameOnly) || group.favorites.includes("browse:" + nameOnly);
+    }
+    // Conversely, if the user later deletes their Library copy while Node Pack / Browse templates are enabled,
+    // fall back to showing the template as checked:
+    if (key.startsWith("pack:") && group.includeNodePacks) {
+      return group.favorites.includes("lib:" + nameOnly);
+    }
+    if (key.startsWith("browse:") && group.includeBrowse) {
+      return group.favorites.includes("lib:" + nameOnly);
+    }
+    return false;
+  }
+
+  function promoteGroupFavoritesToLibrary(group, libraryNamesSet) {
+    if (!group || !Array.isArray(group.favorites) || !(libraryNamesSet instanceof Set) || libraryNamesSet.size === 0) {
+      return group;
+    }
+    let changed = false;
+    const nextFavs = [];
+    const nextLabels = { ...(group.favoriteLabels || {}) };
+    for (const rawKey of group.favorites) {
+      const k = String(rawKey || "").trim().toLowerCase();
+      if (!k) continue;
+      const colonIdx = k.indexOf(":");
+      const prefix = colonIdx !== -1 ? k.slice(0, colonIdx) : "";
+      const namePart = colonIdx !== -1 ? k.slice(colonIdx + 1).trim() : k;
+      if ((prefix === "pack" || prefix === "browse") && namePart && libraryNamesSet.has(namePart)) {
+        const libKey = "lib:" + namePart;
+        if (!nextFavs.includes(libKey)) {
+          nextFavs.push(libKey);
+        }
+        if (nextLabels[k] && !nextLabels[libKey]) {
+          nextLabels[libKey] = nextLabels[k];
+        }
+        delete nextLabels[k];
+        changed = true;
+      } else if (!nextFavs.includes(k)) {
+        nextFavs.push(k);
+      }
+    }
+    if (!changed) return group;
+    return createWorkflowGroup(group.name, {
+      ...group,
+      favorites: nextFavs,
+      favoriteLabels: nextLabels
+    });
   }
 
   function injectSwitcherStyles() {
@@ -540,6 +1015,48 @@ _WORKFLOW_SWITCHER_JS: str = r"""
         background-color: rgba(90, 200, 250, 0.14);
         border-color: rgba(90, 200, 250, 0.32);
       }
+      .inv7-wfs-group-mini-wrap {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: 22px;
+        padding: 0 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        background-color: rgba(255, 255, 255, 0.04);
+        color: var(--chakra-colors-fg\\.muted, #a1a1aa);
+        font-size: 10px;
+        font-weight: 600;
+        cursor: pointer;
+        flex-shrink: 0;
+        max-width: 145px;
+        transition: color 0.12s ease, background-color 0.12s ease, border-color 0.12s ease;
+      }
+      .inv7-wfs-group-mini-wrap:hover {
+        color: var(--chakra-colors-fg, #f4f4f5);
+        background-color: rgba(90, 200, 250, 0.12);
+        border-color: rgba(90, 200, 250, 0.35);
+      }
+      .inv7-wfs-group-mini-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 96px;
+      }
+      .inv7-wfs-group-mini-select {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0;
+        cursor: pointer;
+        font-size: 11px;
+      }
+      .inv7-wfs-group-mini-select option {
+        background-color: #18181b;
+        color: #f4f4f5;
+      }
       .inv7-wfs-acc-body {
         display: flex;
         flex-direction: column;
@@ -549,6 +1066,12 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       }
       .inv7-wfs-view-box[data-open="false"] .inv7-wfs-acc-body {
         display: none;
+      }
+      ::selection,
+      input::selection,
+      textarea::selection {
+        background-color: var(--chakra-colors-accent-solid, #38bdf8) !important;
+        color: var(--chakra-colors-accent-contrast, #16181d) !important;
       }
       .inv7-wfs-header-checks {
         display: inline-flex;
@@ -750,6 +1273,50 @@ _WORKFLOW_SWITCHER_JS: str = r"""
         background-color: rgba(139, 92, 246, 0.22);
         color: #c4b5fd;
       }
+      .inv7-wfs-source-tag[data-source-kind="shared"] {
+        background-color: rgba(34, 197, 94, 0.18);
+        color: #86efac;
+      }
+      .inv7-wfs-source-tag[data-source-kind="other"] {
+        background-color: rgba(148, 163, 184, 0.20);
+        color: #cbd5e1;
+      }
+      .inv7-wfs-source-tag[data-source-kind="missing"] {
+        background-color: rgba(239, 68, 68, 0.22);
+        color: #fca5a5;
+        border: 1px solid rgba(239, 68, 68, 0.42);
+      }
+      .inv7-wfs-checkitem[data-missing="true"] {
+        color: #fca5a5;
+      }
+      .inv7-wfs-checkitem[data-missing="true"] .inv7-wfs-checkitem-name {
+        text-decoration: line-through;
+        color: #f87171;
+      }
+      .inv7-wfs-checkitem[data-missing="true"] input {
+        accent-color: #ef4444;
+      }
+      .inv7-wfs-missing-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 5px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        background-color: rgba(239, 68, 68, 0.14);
+        border: 1px solid rgba(239, 68, 68, 0.38);
+        color: #fecaca;
+      }
+      .inv7-wfs-group-box {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 7px 8px;
+        border-radius: 5px;
+        background-color: rgba(90, 200, 250, 0.07);
+        border: 1px solid rgba(90, 200, 250, 0.24);
+      }
       .inv7-wfs-folder-tag {
         display: inline-flex;
         align-items: center;
@@ -845,102 +1412,251 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       .filter((t) => t.length > 0);
   }
 
-  async function refreshAllWorkflows() {
-    if (scanInFlight) return;
-    scanInFlight = true;
+  const LIBRARY_SOURCE_LABELS = { own: "Your Library", shared: "Shared", other: "Other User" };
+
+  // Single-user: everything belongs to "system" and is shared, so all of it is "own".
+  // Multi-user: the user listing holds the caller's own workflows (an admin's holds everyone's), the
+  // is_public listing what others shared. Own entries win name clashes, so favorites keyed by name
+  // resolve to the user's own copy first.
+  function mergeLibraryListings(userItems, sharedItems, me) {
+    const rank = { own: 0, shared: 1, other: 2 };
+    const byId = new Map();
+    for (const wf of [...(userItems || []), ...(sharedItems || [])]) {
+      if (!wf || !wf.workflow_id || !wf.name || byId.has(wf.workflow_id)) continue;
+      const ownership = (wf.user_id || SINGLE_USER_ID) === me ? "own" : wf.is_public ? "shared" : "other";
+      byId.set(wf.workflow_id, { wf, ownership });
+    }
+    const ordered = [...byId.values()].sort((a, b) => rank[a.ownership] - rank[b.ownership]);
+    const seenNames = new Set();
+    return ordered.filter(({ wf }) => {
+      const key = wf.name.trim().toLowerCase();
+      if (seenNames.has(key)) return false;
+      seenNames.add(key);
+      return true;
+    });
+  }
+
+  function isWorkflowPageComplete(data, perPage) {
+    if (!data || typeof data !== "object") return false;
+    if (typeof data.pages === "number") return data.pages <= 1;
+    const items = Array.isArray(data.items) ? data.items : [];
+    return items.length < (perPage || 100);
+  }
+
+  async function fetchWorkflowListItemsWithStatus(query) {
     try {
-      const q = switcherConfig.customFolders
-        .map((f) => "folder=" + encodeURIComponent(f))
-        .join("&");
-      const scanUrl = "/workflow-switcher/scan" + (q ? "?" + q : "");
-      const [libResp, browseResp, diskResp] = await Promise.all([
-        fetch("/api/v1/workflows/?page=0&per_page=100&categories=user&order_by=name&direction=ASC", { cache: "no-store" }).catch(() => null),
-        fetch("/api/v1/workflows/?page=0&per_page=100&categories=default&order_by=name&direction=ASC", { cache: "no-store" }).catch(() => null),
-        fetch(scanUrl, { cache: "no-store" }).catch(() => null)
-      ]);
+      const resp = await apiFetch("/api/v1/workflows/?page=0&per_page=100&order_by=name&direction=ASC&" + query);
+      if (!resp || !resp.ok) return { ok: false, complete: false, items: [] };
+      const data = await resp.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      return { ok: true, complete: isWorkflowPageComplete(data, 100), items: items };
+    } catch (_) {
+      return { ok: false, complete: false, items: [] };
+    }
+  }
 
-      const combined = [];
-      const seenLibraryNames = new Set();
+  let lastDiscoveredSignature = "";
+  let lastScanPackNames = new Set();
+  let lastScanBrowseNames = new Set();
 
-      if (libResp && libResp.ok) {
-        const libData = await libResp.json();
-        const libItems = Array.isArray(libData.items) ? libData.items : [];
-        const fullRecords = await Promise.all(
-          libItems.map((wf) =>
-            wf && wf.workflow_id
-              ? fetch("/api/v1/workflows/i/" + encodeURIComponent(wf.workflow_id), { cache: "no-store" })
-                  .then((r) => (r.ok ? r.json() : null))
-                  .catch(() => null)
-              : Promise.resolve(null)
-          )
-        );
-        for (let i = 0; i < libItems.length; i++) {
-          const wf = libItems[i];
-          if (!wf || !wf.workflow_id || !wf.name) continue;
-          const record = fullRecords[i];
-          const inner = record && record.workflow ? record.workflow : null;
-          const headings = [];
-          if (inner && inner.form && inner.form.elements && typeof inner.form.elements === "object") {
-            for (const el of Object.values(inner.form.elements)) {
-              if (el && el.type === "heading" && el.data && el.data.content) {
-                const h = String(el.data.content).trim().toLowerCase();
-                if (h) headings.push(h);
+  function computeDiscoveredSignature(items) {
+    if (!Array.isArray(items)) return "";
+    return items.map((w) => String(w.id || "") + ":" + String(w.name || "")).join("|");
+  }
+
+  function refreshAllWorkflows(options) {
+    const forceRender = Boolean(options && options.forceRender);
+    if (activeScanPromise) {
+      if (forceRender) {
+        return activeScanPromise.then(() => rehydrateAllSwitcherWidgets()).catch(() => {});
+      }
+      return activeScanPromise;
+    }
+    reloadConfigIfUserChanged();
+    let changed = false;
+    activeScanPromise = (async () => {
+      try {
+        const [userRes, sharedRes, browseResp, diskResp] = await Promise.all([
+          fetchWorkflowListItemsWithStatus("categories=user"),
+          fetchWorkflowListItemsWithStatus("categories=user&is_public=true"),
+          apiFetch("/api/v1/workflows/?page=0&per_page=100&categories=default&order_by=name&direction=ASC").catch(() => null),
+          apiFetch("/workflow-switcher/scan").catch(() => null)
+        ]);
+
+        const combined = [];
+        const seenLibraryNames = new Set();
+        const libOk = Boolean(userRes.ok && userRes.complete && sharedRes.ok && sharedRes.complete);
+        let browseOk = false;
+        let packOk = false;
+
+        const libEntries = mergeLibraryListings(userRes.items, sharedRes.items, currentUserId());
+        if (libEntries.length > 0) {
+          const libItems = libEntries.map((entry) => entry.wf);
+          const fullRecords = await Promise.all(
+            libItems.map((wf) =>
+              apiFetch("/api/v1/workflows/i/" + encodeURIComponent(wf.workflow_id))
+                .then((r) => (r.ok ? r.json() : null))
+                .catch(() => null)
+            )
+          );
+          for (let i = 0; i < libItems.length; i++) {
+            const wf = libItems[i];
+            const ownership = libEntries[i].ownership;
+            const record = fullRecords[i];
+            const inner = record && record.workflow ? record.workflow : null;
+            const headings = [];
+            if (inner && inner.form && inner.form.elements && typeof inner.form.elements === "object") {
+              for (const el of Object.values(inner.form.elements)) {
+                if (el && (el.type === "heading" || el.type === "collapsible") && el.data && el.data.content) {
+                  const h = String(el.data.content).trim().toLowerCase();
+                  if (h) headings.push(h);
+                }
               }
             }
+            const tags = parseTagsList(wf.tags || (inner && inner.tags));
+            seenLibraryNames.add(wf.name.trim().toLowerCase());
+            combined.push({
+              id: "lib:" + wf.workflow_id,
+              workflow_id: wf.workflow_id,
+              name: wf.name,
+              description: wf.description || (inner && inner.description) || "",
+              tags: tags,
+              headings: headings,
+              isDefaultLib: false,
+              isPack: false,
+              isOwn: ownership === "own",
+              ownership: ownership,
+              source: LIBRARY_SOURCE_LABELS[ownership]
+            });
           }
-          const tags = parseTagsList(wf.tags || (inner && inner.tags));
-          seenLibraryNames.add(wf.name.trim().toLowerCase());
-          combined.push({
-            id: "lib:" + wf.workflow_id,
-            workflow_id: wf.workflow_id,
-            name: wf.name,
-            description: wf.description || (inner && inner.description) || "",
-            tags: tags,
-            headings: headings,
-            isDefaultLib: false,
-            isPack: false,
-            source: "Your Library"
+        }
+
+        const seenPackNames = new Set();
+        const seenBrowseNames = new Set();
+        if (diskResp && diskResp.ok) {
+          try {
+            const diskData = await diskResp.json();
+            const diskItems = Array.isArray(diskData.items) ? diskData.items : [];
+            packOk = diskItems.length < 500;
+            for (const item of diskItems) {
+              const nmLower = (item.name || "").trim().toLowerCase();
+              if (nmLower) seenPackNames.add(nmLower);
+              // If the same workflow name already exists in Your Library, Your Library takes priority!
+              if (seenLibraryNames.has(nmLower)) continue;
+              combined.push({
+                ...item,
+                // Every disk-scanned JSON file (`file:...`) is a disk/pack template until saved into Your Library:
+                isPack: true,
+                tags: parseTagsList(item.tags)
+              });
+            }
+          } catch (_) {}
+        }
+
+        if (browseResp && browseResp.ok) {
+          try {
+            const browseData = await browseResp.json();
+            browseOk = isWorkflowPageComplete(browseData, 100);
+            for (const wf of browseData.items || []) {
+              if (!wf || !wf.workflow_id || !wf.name) continue;
+              const nmLower = wf.name.trim().toLowerCase();
+              if (seenPackNames.has(nmLower)) continue;
+              if (nmLower) seenBrowseNames.add(nmLower);
+              if (seenLibraryNames.has(nmLower)) continue;
+              combined.push({
+                id: "lib:" + wf.workflow_id,
+                workflow_id: wf.workflow_id,
+                name: wf.name,
+                description: wf.description || "",
+                tags: parseTagsList(wf.tags),
+                headings: [],
+                isDefaultLib: true,
+                isPack: false,
+                source: "Built-in (Browse)"
+              });
+            }
+          } catch (_) {}
+        }
+
+        lastScanPackNames = seenPackNames;
+        lastScanBrowseNames = seenBrowseNames;
+
+        const prevStatusSig = JSON.stringify(lastScanStatus);
+        lastScanStatus = { lib: libOk, browse: browseOk, pack: packOk };
+        if (libOk && seenLibraryNames.size > 0 && Array.isArray(switcherConfig.groups)) {
+          let groupsPromoted = false;
+          switcherConfig.groups = switcherConfig.groups.map((grp) => {
+            const promoted = promoteGroupFavoritesToLibrary(grp, seenLibraryNames);
+            if (promoted !== grp) groupsPromoted = true;
+            return promoted;
           });
+          if (groupsPromoted) {
+            saveConfig(switcherConfig);
+          }
+        }
+        const nextSig = computeDiscoveredSignature(combined);
+        changed =
+          !hasCompletedInitialScan ||
+          nextSig !== lastDiscoveredSignature ||
+          JSON.stringify(lastScanStatus) !== prevStatusSig;
+        lastDiscoveredSignature = nextSig;
+        allDiscoveredWorkflows = combined;
+        hasCompletedInitialScan = true;
+      } finally {
+        lastScanFinishedAt = Date.now();
+        activeScanPromise = null;
+        if (changed || forceRender) {
+          rehydrateAllSwitcherWidgets();
         }
       }
+    })();
+    return activeScanPromise;
+  }
 
-      if (browseResp && browseResp.ok) {
-        const browseData = await browseResp.json();
-        for (const wf of browseData.items || []) {
-          if (!wf || !wf.workflow_id || !wf.name) continue;
-          if (seenLibraryNames.has(wf.name.trim().toLowerCase())) continue;
-          combined.push({
-            id: "lib:" + wf.workflow_id,
-            workflow_id: wf.workflow_id,
-            name: wf.name,
-            description: wf.description || "",
-            tags: parseTagsList(wf.tags),
-            headings: [],
-            isDefaultLib: true,
-            isPack: false,
-            source: "Built-in (Browse)"
-          });
-        }
+  function maybeAutoRefreshWorkflows() {
+    if (activeScanPromise) return;
+    if (Date.now() - lastScanFinishedAt < 2500) return;
+    refreshAllWorkflows().catch(() => {});
+  }
+
+  function attachSelectInteractionGuard(selectEl) {
+    if (!selectEl) return;
+    const flushPending = () => {
+      if (pendingRehydrateAfterSelect) {
+        pendingRehydrateAfterSelect = false;
+        window.setTimeout(() => rehydrateAllSwitcherWidgets(), 0);
       }
+    };
+    selectEl.addEventListener("focusout", flushPending);
+    selectEl.addEventListener("change", flushPending);
+  }
 
-      if (diskResp && diskResp.ok) {
-        const diskData = await diskResp.json();
-        for (const item of diskData.items || []) {
-          // If the same workflow name already exists in Your Library, Your Library takes priority!
-          if (seenLibraryNames.has((item.name || "").trim().toLowerCase())) continue;
-          combined.push({
-            ...item,
-            isPack: item.source && item.source.startsWith("Node Pack"),
-            tags: parseTagsList(item.tags)
-          });
-        }
-      }
-
-      allDiscoveredWorkflows = combined;
-    } finally {
-      scanInFlight = false;
+  function confirmAndCleanMissingForGroup(groupId) {
+    if (reloadConfigIfUserChanged()) {
       rehydrateAllSwitcherWidgets();
+      return;
     }
+    const targetGrp = switcherConfig.groups.find((g) => g.id === groupId);
+    if (!targetGrp) return;
+    const missing = findMissingFavoritesForGroup(targetGrp, allDiscoveredWorkflows, lastScanStatus);
+    if (missing.length === 0) return;
+    const promptMsg =
+      "Remove " +
+      missing.length +
+      (missing.length === 1 ? " missing workflow" : " missing workflows") +
+      " from group \"" +
+      targetGrp.name +
+      "\"?\n\n" +
+      missing.map((m) => "• " + m.label).join("\n");
+    if (typeof window.confirm === "function" && !window.confirm(promptMsg)) {
+      return;
+    }
+    const cleaned = removeMissingFavoritesFromGroup(targetGrp, allDiscoveredWorkflows, lastScanStatus);
+    updateGroupById(targetGrp.id, {
+      favorites: cleaned.favorites,
+      favoriteLabels: cleaned.favoriteLabels
+    });
+    rehydrateAllSwitcherWidgets();
   }
 
   function findWorkflowUiAdapter(startEl) {
@@ -949,22 +1665,27 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       document.querySelector(".inv7-wfs-edit-box"),
       document.querySelector(".inv7-wfs-view-box"),
       document.querySelector("input[type='file'][accept*='.json']"),
-      document.querySelector("[role='region']")
+      ...document.querySelectorAll("[role='region']")
     ];
     for (const el of candidates) {
-      if (!el) continue;
-      const fiberKey = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
-      if (!fiberKey) continue;
-      let cur = el[fiberKey];
-      while (cur) {
-        const props = cur.memoizedProps;
-        if (props && typeof props === "object") {
-          const adp = props.adapter || props.value;
-          if (adp && adp.commands && typeof adp.commands.setWorkflowSource === "function" && adp.project) {
-            return adp;
+      let domNode = el;
+      while (domNode && domNode !== document.body) {
+        const fiberKey = Object.keys(domNode).find((k) => k.startsWith("__reactFiber$"));
+        if (fiberKey) {
+          let cur = domNode[fiberKey];
+          while (cur) {
+            const props = cur.memoizedProps;
+            if (props && typeof props === "object") {
+              const adp = props.adapter || props.value;
+              if (adp && adp.commands && typeof adp.commands.setWorkflowSource === "function" && adp.project) {
+                return adp;
+              }
+            }
+            cur = cur.return;
           }
+          break;
         }
-        cur = cur.return;
+        domNode = domNode.parentElement;
       }
     }
     return null;
@@ -973,6 +1694,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
   let hydratedWorkflowIds = new Set();
 
   function captureActiveWorkflowSectionStates() {
+    reloadConfigIfUserChanged();
     const adapter = findWorkflowUiAdapter();
     if (!adapter || !adapter.project) return null;
     const snap = adapter.project.getSnapshot();
@@ -993,7 +1715,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     const byTitleAndId = {};
     const elements = (doc.form && doc.form.elements) || {};
     for (const [elId, el] of Object.entries(elements)) {
-      if (el && el.type === "heading" && typeof currentMap[elId] === "boolean") {
+      if (el && el.type === "collapsible" && typeof currentMap[elId] === "boolean") {
         byTitleAndId[elId] = currentMap[elId];
         const titleKey = "title:" + String((el.data && el.data.content) || "").trim().toLowerCase();
         byTitleAndId[titleKey] = currentMap[elId];
@@ -1036,7 +1758,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     let foundAny = false;
 
     for (const [elId, el] of Object.entries(elements)) {
-      if (!el || el.type !== "heading") continue;
+      if (!el || el.type !== "collapsible") continue;
       if (el.data && typeof el.data.defaultOpen === "boolean") {
         restored[elId] = el.data.defaultOpen;
         foundAny = true;
@@ -1080,7 +1802,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     const clonedElements = JSON.parse(JSON.stringify((document.form && document.form.elements) || {}));
     if (sectionStatesMap && typeof sectionStatesMap === "object") {
       for (const [elId, el] of Object.entries(clonedElements)) {
-        if (el && el.type === "heading" && el.data && typeof sectionStatesMap[elId] === "boolean") {
+        if (el && el.type === "collapsible" && el.data && typeof sectionStatesMap[elId] === "boolean") {
           el.data.defaultOpen = sectionStatesMap[elId];
         }
       }
@@ -1121,39 +1843,276 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     };
   }
 
-  async function saveOrUpdateCurrentWorkflowInYours(hostDiv, statusBtn) {
-    const adapter = findWorkflowUiAdapter(hostDiv);
-    if (!adapter || typeof adapter.getProjectGraph !== "function") {
-      if (statusBtn) statusBtn.textContent = "⚠ Open via menu";
+  async function copyCheckedPackWorkflowsOfActiveGroupToYours(skipNameLower) {
+    const activeGroup = getActiveGroup();
+    if (!activeGroup || !Array.isArray(activeGroup.favorites) || activeGroup.favorites.length === 0) {
+      return 0;
+    }
+    const existingOwnLibNames = new Set(
+      allDiscoveredWorkflows
+        .filter((w) => w.isOwn && w.workflow_id && w.name)
+        .map((w) => w.name.trim().toLowerCase())
+    );
+    if (skipNameLower) {
+      existingOwnLibNames.add(skipNameLower);
+    }
+    const packCandidates = allDiscoveredWorkflows.filter((w) => {
+      if (!w || !w.id) return false;
+      const isDiskPack = w.id.startsWith("file:");
+      const isBrowseTemplate = Boolean(w.isDefaultLib && w.workflow_id);
+      if (!isDiskPack && !isBrowseTemplate) return false;
+      const nm = (w.name || "").trim().toLowerCase();
+      if (!nm || existingOwnLibNames.has(nm)) return false;
+      return isItemFavoritedInGroup(activeGroup, w);
+    });
+    let copiedCount = 0;
+    for (const packItem of packCandidates) {
+      try {
+        let rawData = null;
+        if (packItem.id.startsWith("file:")) {
+          const fileId = packItem.file_id || packItem.id.slice(5);
+          const fileResp = await apiFetch(
+            "/workflow-switcher/file?id=" + encodeURIComponent(fileId),
+            { cache: "no-store" }
+          );
+          if (!fileResp || !fileResp.ok) continue;
+          rawData = await fileResp.json();
+        } else if (packItem.isDefaultLib && packItem.workflow_id) {
+          const dtoResp = await apiFetch(
+            "/api/v1/workflows/i/" + encodeURIComponent(packItem.workflow_id),
+            { cache: "no-store" }
+          );
+          if (!dtoResp || !dtoResp.ok) continue;
+          rawData = await dtoResp.json();
+        }
+        if (!rawData) continue;
+        const wfPayload =
+          rawData && typeof rawData.workflow === "object" && rawData.workflow !== null
+            ? { ...rawData.workflow }
+            : { ...rawData };
+        delete wfPayload.id;
+        wfPayload.meta = {
+          ...(wfPayload.meta && typeof wfPayload.meta === "object" ? wfPayload.meta : {}),
+          category: "user",
+          version: "3.0.0"
+        };
+        const createResp = await apiFetch("/api/v1/workflows/", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workflow: wfPayload })
+        });
+        if (createResp && createResp.ok) {
+          copiedCount += 1;
+          existingOwnLibNames.add((packItem.name || "").trim().toLowerCase());
+        }
+      } catch (_) {}
+    }
+    return copiedCount;
+  }
+
+  async function removeCheckedWorkflowsOfActiveGroupFromYours(statusBtn) {
+    if (statusBtn && statusBtn.disabled) return;
+    const defaultLabel = "🗑 Remove Checked from Yours";
+    const setStatus = (txt) => {
+      if (statusBtn) statusBtn.textContent = txt;
+    };
+    const restoreStatus = () => {
+      if (statusBtn) statusBtn.textContent = defaultLabel;
+    };
+    const activeGroup = getActiveGroup();
+    if (!activeGroup || !Array.isArray(activeGroup.favorites) || activeGroup.favorites.length === 0) {
+      setStatus("No workflows checked");
+      window.setTimeout(restoreStatus, 1600);
       return;
     }
-    const snap = adapter.project.getSnapshot();
-    const doc = adapter.getProjectGraph();
-    if (!doc) return;
+    const ownTargets = allDiscoveredWorkflows.filter(
+      (w) => w && w.isOwn && w.workflow_id && isItemFavoritedInGroup(activeGroup, w)
+    );
+    if (ownTargets.length === 0) {
+      setStatus("None in Yours");
+      window.setTimeout(restoreStatus, 1600);
+      return;
+    }
+    const replaceable = [];
+    const ownOnly = [];
+    for (const w of ownTargets) {
+      const nmLower = (w.name || "").trim().toLowerCase();
+      if (lastScanPackNames.has(nmLower) || lastScanBrowseNames.has(nmLower)) {
+        replaceable.push(w);
+      } else {
+        ownOnly.push(w);
+      }
+    }
+    if (replaceable.length === 0) {
+      setStatus("Custom workflows kept (no template)");
+      window.setTimeout(restoreStatus, 2000);
+      return;
+    }
+    const keptNote =
+      ownOnly.length > 0
+        ? "\n\n(Note: " +
+          ownOnly.length +
+          " custom workflow(s) without a Node Pack / Built-in template will be KEPT safe in Yours: " +
+          ownOnly.map((w) => w.name).join(", ") +
+          ".)"
+        : "";
+    const promptMsg =
+      "Remove " +
+      replaceable.length +
+      (replaceable.length === 1 ? " checked workflow" : " checked workflows") +
+      " of group \"" +
+      activeGroup.name +
+      "\" from Your Library (Yours)?\n\n" +
+      replaceable.map((w) => "• " + w.name).join("\n") +
+      "\n\n(Their Node Pack / Built-in templates on disk are NOT deleted — they will immediately reappear in the list so you can load or re-save the latest versions.)" +
+      keptNote;
+    if (typeof window.confirm === "function" && !window.confirm(promptMsg)) {
+      return;
+    }
+
+    if (statusBtn) statusBtn.disabled = true;
+    setStatus("Removing...");
+    try {
+      let removedCount = 0;
+      const removedByName = new Map();
+      let activatedPack = false;
+      let activatedBrowse = false;
+
+      for (const target of replaceable) {
+        try {
+          const delResp = await apiFetch("/api/v1/workflows/i/" + encodeURIComponent(target.workflow_id), {
+            method: "DELETE"
+          });
+          if (delResp && (delResp.ok || delResp.status === 404)) {
+            removedCount += 1;
+            const nmLower = (target.name || "").trim().toLowerCase();
+            if (nmLower) {
+              const isPack = lastScanPackNames.has(nmLower);
+              const newPrefix = isPack ? "pack:" : "browse:";
+              if (isPack) activatedPack = true;
+              else activatedBrowse = true;
+              removedByName.set(nmLower, { newKey: newPrefix + nmLower, label: target.name });
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (removedCount > 0) {
+        const nextLabels = { ...(activeGroup.favoriteLabels || {}) };
+        const nextFavs = (activeGroup.favorites || []).map((k) => {
+          const keyLower = String(k || "").trim().toLowerCase();
+          if (keyLower.startsWith("lib:")) {
+            const nm = keyLower.slice(4).trim();
+            const rep = removedByName.get(nm);
+            if (rep) {
+              const existingLabel = nextLabels[keyLower] || rep.label;
+              delete nextLabels[keyLower];
+              if (existingLabel) nextLabels[rep.newKey] = existingLabel;
+              return rep.newKey;
+            }
+          }
+          return keyLower;
+        });
+        const patch = {
+          favorites: nextFavs,
+          favoriteLabels: nextLabels
+        };
+        if (activatedPack) patch.includeNodePacks = true;
+        if (activatedBrowse) patch.includeBrowse = true;
+        updateGroupById(activeGroup.id, patch);
+        window.dispatchEvent(new CustomEvent("invoke7-refresh-workflow-library"));
+        setStatus("✓ Removed " + removedCount + " from Yours!");
+        window.setTimeout(restoreStatus, 1800);
+        await refreshAllWorkflows({ forceRender: true });
+      } else {
+        setStatus("⚠ Remove failed");
+        window.setTimeout(restoreStatus, 1800);
+      }
+    } finally {
+      if (statusBtn) statusBtn.disabled = false;
+    }
+  }
+
+  async function saveOrUpdateCurrentWorkflowInYours(hostDiv, statusBtn) {
+    const isIconBtn = Boolean(statusBtn && statusBtn.getAttribute("data-icon-btn") === "true");
+    const defaultBtnLabel = "💾 Copy / Save to Yours";
+    const setBtnStatus = (text, stateKind) => {
+      if (!statusBtn) return;
+      if (isIconBtn) {
+        if (stateKind === "ok") {
+          statusBtn.style.color = "#4ade80";
+          statusBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`;
+        } else if (stateKind === "err") {
+          statusBtn.style.color = "#f87171";
+        }
+        statusBtn.title = text;
+      } else {
+        statusBtn.textContent = text;
+      }
+    };
+    const restoreBtnStatus = () => {
+      if (!statusBtn) return;
+      if (isIconBtn) {
+        statusBtn.style.color = "";
+        statusBtn.title = "Copy / Save active workflow to Your Library (Yours)";
+        statusBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>`;
+      } else {
+        statusBtn.textContent = defaultBtnLabel;
+      }
+    };
+
+    const adapter = findWorkflowUiAdapter(hostDiv);
+    const snap = adapter && adapter.project ? adapter.project.getSnapshot() : null;
+    const doc =
+      adapter && typeof adapter.getProjectGraph === "function"
+        ? adapter.getProjectGraph()
+        : snap && snap.projectGraph
+          ? snap.projectGraph
+          : null;
+    if (!doc) {
+      try {
+        setBtnStatus("Saving...", "busy");
+        const onlyCopied = await copyCheckedPackWorkflowsOfActiveGroupToYours("");
+        if (onlyCopied > 0) {
+          window.dispatchEvent(new CustomEvent("invoke7-refresh-workflow-library"));
+          setBtnStatus("✓ Copied " + onlyCopied + " workflows to Yours!", "ok");
+          window.setTimeout(restoreBtnStatus, 1800);
+          await refreshAllWorkflows({ forceRender: true });
+          return;
+        }
+      } catch (_) {}
+      setBtnStatus("⚠ Open via menu", "err");
+      window.setTimeout(restoreBtnStatus, 1800);
+      return;
+    }
 
     const currentSource = snap.activeWorkflow && snap.activeWorkflow.source ? snap.activeWorkflow.source : null;
     const currentNameLower = (doc.name || "").trim().toLowerCase();
+    // Only the user's own records are candidates: a shared or (for admins) another user's workflow with the
+    // same name must never be overwritten in place - saving it creates the user's own copy instead.
     const matchingLibItem = allDiscoveredWorkflows.find(
       (w) =>
-        !w.isPack &&
-        !w.isDefaultLib &&
+        w.isOwn &&
         w.workflow_id &&
         ((currentSource && currentSource.libraryWorkflowId === w.workflow_id) ||
           (currentNameLower && (w.name || "").trim().toLowerCase() === currentNameLower))
     );
 
-    const targetWorkflowId =
-      (currentSource && !String(currentSource.libraryWorkflowId || "").startsWith("default_")
-        ? currentSource.libraryWorkflowId
-        : null) || (matchingLibItem ? matchingLibItem.workflow_id : null);
+    // The workflow the project copy came from is only updated in place when the user owns it.
+    const sourceId = currentSource && currentSource.libraryWorkflowId ? String(currentSource.libraryWorkflowId) : "";
+    const sourceIsOwn =
+      sourceId !== "" &&
+      !sourceId.startsWith("default_") &&
+      (currentSource.ownerUserId || SINGLE_USER_ID) === currentUserId();
+    const targetWorkflowId = (sourceIsOwn ? sourceId : null) || (matchingLibItem ? matchingLibItem.workflow_id : null);
 
     try {
-      if (statusBtn) statusBtn.textContent = "Saving...";
+      setBtnStatus("Saving...", "busy");
       const captured = captureActiveWorkflowSectionStates();
       const sectionStatesMap = captured ? captured.currentMap : null;
       if (targetWorkflowId) {
         const payload = serializeProjectGraphToWorkflowJson(doc, targetWorkflowId, sectionStatesMap);
-        const resp = await fetch("/api/v1/workflows/i/" + encodeURIComponent(targetWorkflowId), {
+        const resp = await apiFetch("/api/v1/workflows/i/" + encodeURIComponent(targetWorkflowId), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ workflow: payload })
@@ -1168,13 +2127,14 @@ _WORKFLOW_SWITCHER_JS: str = r"""
               ownerUserId: updatedDto.user_id
             }
           );
-          if (statusBtn) {
-            statusBtn.textContent = "✓ Updated in Yours!";
-            window.setTimeout(() => {
-              statusBtn.textContent = "💾 Save / Update in Yours";
-            }, 1600);
-          }
-          await refreshAllWorkflows();
+          const extraCopied = await copyCheckedPackWorkflowsOfActiveGroupToYours(currentNameLower);
+          window.dispatchEvent(new CustomEvent("invoke7-refresh-workflow-library"));
+          setBtnStatus(
+            extraCopied > 0 ? "✓ Updated + " + extraCopied + " copied to Yours!" : "✓ Updated in Yours!",
+            "ok"
+          );
+          window.setTimeout(restoreBtnStatus, 1800);
+          await refreshAllWorkflows({ forceRender: true });
           return;
         }
       }
@@ -1182,7 +2142,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       // Create new in Your Library if not found or if PATCH returned 404:
       const newPayload = serializeProjectGraphToWorkflowJson(doc, undefined, sectionStatesMap);
       delete newPayload.id;
-      const createResp = await fetch("/api/v1/workflows/", {
+      const createResp = await apiFetch("/api/v1/workflows/", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ workflow: newPayload })
@@ -1197,18 +2157,19 @@ _WORKFLOW_SWITCHER_JS: str = r"""
             ownerUserId: createdDto.user_id
           }
         );
-        if (statusBtn) {
-          statusBtn.textContent = "✓ Saved to Yours!";
-          window.setTimeout(() => {
-            statusBtn.textContent = "💾 Save / Update in Yours";
-          }, 1600);
-        }
-        await refreshAllWorkflows();
-      } else if (statusBtn) {
-        statusBtn.textContent = "⚠ Save failed";
+        const extraCopied = await copyCheckedPackWorkflowsOfActiveGroupToYours(currentNameLower);
+        window.dispatchEvent(new CustomEvent("invoke7-refresh-workflow-library"));
+        setBtnStatus(
+          extraCopied > 0 ? "✓ Copied " + (extraCopied + 1) + " workflows to Yours!" : "✓ Copied to Yours!",
+          "ok"
+        );
+        window.setTimeout(restoreBtnStatus, 1800);
+        await refreshAllWorkflows({ forceRender: true });
+      } else {
+        setBtnStatus("⚠ Save failed", "err");
       }
     } catch (_) {
-      if (statusBtn) statusBtn.textContent = "⚠ Save error";
+      setBtnStatus("⚠ Save error", "err");
     }
   }
 
@@ -1222,18 +2183,16 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     let loadedLibraryDto = null;
 
     if (item.id.startsWith("file:")) {
-      const folderQuery = switcherConfig.customFolders
-        .map((f) => "&folder=" + encodeURIComponent(f))
-        .join("");
-      const resp = await fetch(
-        "/workflow-switcher/file?path=" + encodeURIComponent(item.path) + folderQuery,
+      const fileId = item.file_id || item.id.slice(5);
+      const resp = await apiFetch(
+        "/workflow-switcher/file?id=" + encodeURIComponent(fileId),
         { cache: "no-store" }
       );
       if (!resp.ok) return;
       jsonText = await resp.text();
       filename = item.filename || filename;
     } else if (item.id.startsWith("lib:")) {
-      const resp = await fetch("/api/v1/workflows/i/" + encodeURIComponent(item.workflow_id), { cache: "no-store" });
+      const resp = await apiFetch("/api/v1/workflows/i/" + encodeURIComponent(item.workflow_id), { cache: "no-store" });
       if (!resp.ok) return;
       const dto = await resp.json();
       loadedLibraryDto = dto;
@@ -1403,20 +2362,26 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     return getWorkflowFamilyLabel(item).toLowerCase();
   }
 
-  function getPoolForWorkflowState(wfState) {
-    const includePacks = Boolean(wfState && wfState.includeNodePacks);
-    const includeBrowse = Boolean(wfState && wfState.includeBrowse);
+  function getPoolForGroup(group) {
+    const activeGrp = group || getActiveGroup();
+    const includePacks = Boolean(activeGrp && activeGrp.includeNodePacks);
+    const includeBrowse = Boolean(activeGrp && activeGrp.includeBrowse);
     return allDiscoveredWorkflows.filter((w) => {
-      if (isItemFavoritedInState(wfState, w)) return true;
+      if (isItemFavoritedInGroup(activeGrp, w)) return true;
       if (w.isPack) return includePacks;
       if (w.isDefaultLib) return includeBrowse;
       return true;
     });
   }
 
-  function buildDropdownSelectElement(wfState) {
-    const pool = getPoolForWorkflowState(wfState);
-    const enabledItems = pool.filter((w) => isItemFavoritedInState(wfState, w));
+  function buildDropdownSelectElement() {
+    const activeGroup = getActiveGroup();
+    const allGroups = Array.isArray(switcherConfig.groups) ? switcherConfig.groups : [activeGroup];
+    const pool = getPoolForGroup(activeGroup);
+    const enabledItems = pool.filter((w) => isItemFavoritedInGroup(activeGroup, w));
+    const missingItems = hasCompletedInitialScan
+      ? findMissingFavoritesForGroup(activeGroup, allDiscoveredWorkflows, lastScanStatus)
+      : [];
     const activeName = detectActiveCenterWorkflowName(pool);
     const matchedItem = activeName
       ? pool.find((w) => w.name && w.name.toLowerCase() === activeName.toLowerCase()) || null
@@ -1424,28 +2389,23 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
     const select = document.createElement("select");
     select.className = "inv7-wfs-select";
+    attachSelectInteractionGuard(select);
 
     const placeholder = document.createElement("option");
     placeholder.value = "";
-    placeholder.selected = true;
+    placeholder.selected = !matchedItem;
     placeholder.disabled = true;
     placeholder.hidden = true;
     placeholder.textContent =
-      enabledItems.length === 0
-        ? activeName
-          ? activeName + " (0 favorites checked in Edit)"
-          : "— No favorite workflows selected (configure in Edit tab) —"
+      enabledItems.length === 0 && missingItems.length === 0
+        ? "— No workflows in group \"" + activeGroup.name + "\" (check workflows in Edit tab) —"
         : activeName
           ? activeName
-          : "— Select a favorite workflow (" + enabledItems.length + " available) —";
+          : "— Select workflow in \"" + activeGroup.name + "\" (" + enabledItems.length + ") —";
     select.appendChild(placeholder);
 
     let prevFamily = null;
     for (const item of enabledItems) {
-      // Omit the currently active workflow from the open dropdown choices since it is already shown in the closed box above.
-      if (activeName && item.name && item.name.toLowerCase() === activeName.toLowerCase()) {
-        continue;
-      }
       const family = getWorkflowFamilyKey(item);
       if (prevFamily !== null && family !== prevFamily) {
         const sep = document.createElement("hr");
@@ -1455,8 +2415,10 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
       const isPack = Boolean(item.isPack || (item.id && item.id.startsWith("file:")));
       const isBrowse = Boolean(item.isDefaultLib);
+      const isCurrentActive = Boolean(activeName && item.name && item.name.toLowerCase() === activeName.toLowerCase());
       const opt = document.createElement("option");
       opt.value = item.id;
+      opt.selected = isCurrentActive;
       opt.textContent = item.name;
       if (isPack) {
         opt.setAttribute("data-source-kind", "pack");
@@ -1466,7 +2428,24 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       select.appendChild(opt);
     }
 
+    if (missingItems.length > 0) {
+      const missingGroup = document.createElement("optgroup");
+      missingGroup.label = "⚠ Deleted / Missing in this group";
+      for (const m of missingItems) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.disabled = true;
+        opt.textContent = "✖ " + m.label + " (deleted — click Clean missing)";
+        missingGroup.appendChild(opt);
+      }
+      select.appendChild(missingGroup);
+    }
+
     select.addEventListener("change", (e) => {
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
       const chosenId = e.target.value;
       const chosen = allDiscoveredWorkflows.find((w) => w.id === chosenId);
       if (chosen) {
@@ -1474,7 +2453,14 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       }
     });
 
-    return { select, matchedItem, activeName, enabledCount: enabledItems.length };
+    return {
+      select,
+      matchedItem,
+      activeName,
+      activeGroup,
+      missingItems,
+      enabledCount: enabledItems.length
+    };
   }
 
   function computeFamilyCounts(workflows) {
@@ -1498,15 +2484,23 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     const outerViewport = hostDiv.closest("[data-scope='scroll-area'][data-part='viewport']");
     const savedOuterScroll = outerViewport ? outerViewport.scrollTop : null;
 
-    let wfState = parseWorkflowMarkerState(ta ? ta.value : "");
-    const commitWfState = (nextState, shouldRebuildCard) => {
-      wfState = nextState;
-      if (ta) {
-        setReactTextareaValue(ta, formatWorkflowMarkerState(wfState));
+    let activeGroup = getActiveGroup();
+    const boundGroupId = activeGroup.id;
+    const commitGroupPatch = (patch, shouldRebuildCard) => {
+      const updated = updateGroupById(boundGroupId, patch);
+      if (!updated) {
+        rehydrateAllSwitcherWidgets();
+        return;
       }
+      activeGroup = updated;
       if (shouldRebuildCard) {
         renderEditCardControls(hostDiv, ta);
       } else {
+        const selectedOpt = Array.from(groupSelect.options).find((o) => o.value === boundGroupId);
+        if (selectedOpt) {
+          const favCount = Array.isArray(activeGroup.favorites) ? activeGroup.favorites.length : 0;
+          selectedOpt.textContent = activeGroup.name + " (" + favCount + " workflows)";
+        }
         updatePreviewSelectInPlace();
       }
       for (const viewBox of document.querySelectorAll(".inv7-wfs-view-box")) {
@@ -1516,6 +2510,185 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
     hostDiv.innerHTML = "";
 
+    // 1. Central Workflow Group Bar (create / switch / rename / delete named groups)
+    const groupBox = document.createElement("div");
+    groupBox.className = "inv7-wfs-group-box";
+
+    const groupHeaderRow = document.createElement("div");
+    groupHeaderRow.className = "inv7-wfs-toprow";
+    groupHeaderRow.style.flexWrap = "wrap";
+
+    const groupLbl = document.createElement("span");
+    groupLbl.className = "inv7-wfs-label";
+    groupLbl.style.color = "rgb(147, 226, 255)";
+    groupLbl.textContent = "📁 Active Workflow Group (shared across all workflows):";
+
+    const groupSelect = document.createElement("select");
+    groupSelect.className = "inv7-wfs-select";
+    groupSelect.style.height = "28px";
+    groupSelect.style.fontSize = "11px";
+    attachSelectInteractionGuard(groupSelect);
+    for (const grp of switcherConfig.groups) {
+      const opt = document.createElement("option");
+      opt.value = grp.id;
+      opt.selected = grp.id === activeGroup.id;
+      const favCount = Array.isArray(grp.favorites) ? grp.favorites.length : 0;
+      opt.textContent = grp.name + " (" + favCount + " workflows)";
+      groupSelect.appendChild(opt);
+    }
+    groupSelect.addEventListener("change", () => {
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
+      if (switcherConfig.groups.some((g) => g.id === groupSelect.value)) {
+        switcherConfig.activeGroupId = groupSelect.value;
+        saveConfig(switcherConfig);
+        rehydrateAllSwitcherWidgets();
+      }
+    });
+
+    const groupActionRow = document.createElement("div");
+    groupActionRow.className = "inv7-wfs-folder-row";
+    groupActionRow.style.flexWrap = "wrap";
+
+    const groupNameInput = document.createElement("input");
+    groupNameInput.type = "text";
+    groupNameInput.className = "inv7-wfs-folder-input";
+    groupNameInput.placeholder = "Rename this group (e.g. LTX Workflows, Comic Workflows)...";
+    groupNameInput.value = activeGroup.name;
+
+    const applyGroupRename = (showFeedback) => {
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
+      const nextName = (groupNameInput.value || "").trim();
+      if (!nextName) return;
+      const duplicate = switcherConfig.groups.some(
+        (g) => g.id !== boundGroupId && g.name.toLowerCase() === nextName.toLowerCase()
+      );
+      if (duplicate) return;
+      const updated = updateGroupById(boundGroupId, { name: nextName });
+      if (!updated) return;
+      activeGroup = updated;
+      const selectedOpt = Array.from(groupSelect.options).find((o) => o.value === boundGroupId);
+      if (selectedOpt) {
+        const favCount = Array.isArray(activeGroup.favorites) ? activeGroup.favorites.length : 0;
+        selectedOpt.textContent = activeGroup.name + " (" + favCount + " workflows)";
+      }
+      if (bulkLbl) {
+        bulkLbl.textContent = "Workflows in group \"" + activeGroup.name + "\":";
+      }
+      updatePreviewSelectInPlace();
+      for (const viewBox of document.querySelectorAll(".inv7-wfs-view-box")) {
+        renderViewWidget(viewBox);
+      }
+      if (showFeedback && renameGroupBtn) {
+        renameGroupBtn.textContent = "✓ Renamed!";
+        window.setTimeout(() => {
+          renameGroupBtn.textContent = "✎ Rename";
+        }, 1200);
+      }
+    };
+
+    // Live-rename as the user types so renaming "Default Group" (or any group) works effortlessly!
+    groupNameInput.addEventListener("input", () => {
+      applyGroupRename(false);
+    });
+    groupNameInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        applyGroupRename(true);
+      }
+    });
+
+    const newGroupBtn = document.createElement("button");
+    newGroupBtn.type = "button";
+    newGroupBtn.className = "inv7-wfs-btn";
+    newGroupBtn.title = "Create a new empty workflow group, switch to it, and focus the name field";
+    newGroupBtn.textContent = "+ New Group";
+    newGroupBtn.addEventListener("click", () => {
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
+      let idx = switcherConfig.groups.length + 1;
+      let nextName = "Group " + idx;
+      while (switcherConfig.groups.some((g) => g.name.toLowerCase() === nextName.toLowerCase())) {
+        idx += 1;
+        nextName = "Group " + idx;
+      }
+      const created = createWorkflowGroup(nextName, {
+        includeNodePacks: activeGroup.includeNodePacks,
+        includeBrowse: activeGroup.includeBrowse
+      });
+      switcherConfig.groups.push(created);
+      switcherConfig.activeGroupId = created.id;
+      saveConfig(switcherConfig);
+      rehydrateAllSwitcherWidgets();
+      window.setTimeout(() => {
+        const nameInp = hostDiv.querySelector(".inv7-wfs-group-box .inv7-wfs-folder-input");
+        if (nameInp) {
+          nameInp.focus();
+          nameInp.select();
+        }
+      }, 20);
+    });
+
+    const renameGroupBtn = document.createElement("button");
+    renameGroupBtn.type = "button";
+    renameGroupBtn.className = "inv7-wfs-btn";
+    renameGroupBtn.title = "Confirm group name";
+    renameGroupBtn.textContent = "✎ Rename";
+    renameGroupBtn.addEventListener("click", () => {
+      applyGroupRename(true);
+    });
+
+    const deleteGroupBtn = document.createElement("button");
+    deleteGroupBtn.type = "button";
+    deleteGroupBtn.className = "inv7-wfs-btn";
+    deleteGroupBtn.disabled = switcherConfig.groups.length <= 1;
+    deleteGroupBtn.style.opacity = switcherConfig.groups.length <= 1 ? "0.45" : "1";
+    deleteGroupBtn.title =
+      switcherConfig.groups.length <= 1
+        ? "At least one workflow group is kept"
+        : "Delete the active workflow group";
+    deleteGroupBtn.textContent = "🗑 Delete Group";
+    deleteGroupBtn.addEventListener("click", () => {
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
+      if (switcherConfig.groups.length <= 1) return;
+      const target = switcherConfig.groups.find((g) => g.id === boundGroupId);
+      if (!target) return;
+      if (
+        Array.isArray(target.favorites) &&
+        target.favorites.length > 0 &&
+        typeof window.confirm === "function" &&
+        !window.confirm("Delete workflow group \"" + target.name + "\" (" + target.favorites.length + " workflows)?")
+      ) {
+        return;
+      }
+      switcherConfig.groups = switcherConfig.groups.filter((g) => g.id !== boundGroupId);
+      switcherConfig.activeGroupId = switcherConfig.groups[0].id;
+      saveConfig(switcherConfig);
+      rehydrateAllSwitcherWidgets();
+    });
+
+    groupHeaderRow.appendChild(groupLbl);
+    groupBox.appendChild(groupHeaderRow);
+    groupBox.appendChild(groupSelect);
+    groupActionRow.appendChild(groupNameInput);
+    groupActionRow.appendChild(newGroupBtn);
+    groupActionRow.appendChild(renameGroupBtn);
+    groupActionRow.appendChild(deleteGroupBtn);
+    groupBox.appendChild(groupActionRow);
+    hostDiv.appendChild(groupBox);
+
+    // 2. Preview Dropdown
     const previewWrap = document.createElement("div");
     previewWrap.style.display = "flex";
     previewWrap.style.flexDirection = "column";
@@ -1523,10 +2696,11 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
     function updatePreviewSelectInPlace() {
       previewWrap.innerHTML = "";
-      const { select, enabledCount } = buildDropdownSelectElement(wfState);
+      const { select, enabledCount } = buildDropdownSelectElement();
       const previewLbl = document.createElement("div");
       previewLbl.className = "inv7-wfs-label";
-      previewLbl.textContent = "Preview Dropdown (" + enabledCount + " favorite workflows enabled in this workflow):";
+      previewLbl.textContent =
+        "Preview Dropdown (" + enabledCount + " workflows active in group \"" + activeGroup.name + "\"):";
       previewWrap.appendChild(previewLbl);
       previewWrap.appendChild(select);
     }
@@ -1534,7 +2708,35 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     updatePreviewSelectInPlace();
     hostDiv.appendChild(previewWrap);
 
-    // Source toggle row: Your Library (cyan) + Built-in Browse (purple) + Node Pack Templates (amber/gold)
+    // 3. Missing / Deleted workflows warning banner (if any workflow in this group was deleted)
+    const missingItems = hasCompletedInitialScan
+      ? findMissingFavoritesForGroup(activeGroup, allDiscoveredWorkflows, lastScanStatus)
+      : [];
+    if (missingItems.length > 0) {
+      const warnBar = document.createElement("div");
+      warnBar.className = "inv7-wfs-missing-banner";
+      const warnTxt = document.createElement("span");
+      warnTxt.textContent =
+        "⚠ " +
+        missingItems.length +
+        (missingItems.length === 1
+          ? " workflow in this group was deleted or renamed."
+          : " workflows in this group were deleted or renamed.");
+      const cleanBtn = document.createElement("button");
+      cleanBtn.type = "button";
+      cleanBtn.className = "inv7-wfs-btn";
+      cleanBtn.style.borderColor = "rgba(248, 113, 113, 0.55)";
+      cleanBtn.style.color = "#fecaca";
+      cleanBtn.textContent = "🧹 Clean missing";
+      cleanBtn.addEventListener("click", () => {
+        confirmAndCleanMissingForGroup(boundGroupId);
+      });
+      warnBar.appendChild(warnTxt);
+      warnBar.appendChild(cleanBtn);
+      hostDiv.appendChild(warnBar);
+    }
+
+    // 4. Source toggle row: Your Library (cyan) + Built-in Browse (purple) + Node Pack Templates (amber/gold)
     const sourceRow = document.createElement("div");
     sourceRow.className = "inv7-wfs-toprow";
     sourceRow.style.flexWrap = "wrap";
@@ -1552,9 +2754,9 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     browseToggleLbl.title = "Also list InvokeAI's built-in Browse workflows (highlighted in lavender/purple)";
     const browseCb = document.createElement("input");
     browseCb.type = "checkbox";
-    browseCb.checked = Boolean(wfState.includeBrowse);
+    browseCb.checked = Boolean(activeGroup.includeBrowse);
     browseCb.addEventListener("change", () => {
-      commitWfState({ ...wfState, includeBrowse: Boolean(browseCb.checked) }, true);
+      commitGroupPatch({ includeBrowse: Boolean(browseCb.checked) }, true);
     });
     const browseSpan = document.createElement("span");
     browseSpan.textContent = "+ Built-in (Browse)";
@@ -1566,9 +2768,9 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     packToggleLbl.title = "Also list unmodified factory templates from Node Pack folders (highlighted in amber/gold)";
     const packCb = document.createElement("input");
     packCb.type = "checkbox";
-    packCb.checked = Boolean(wfState.includeNodePacks);
+    packCb.checked = Boolean(activeGroup.includeNodePacks);
     packCb.addEventListener("change", () => {
-      commitWfState({ ...wfState, includeNodePacks: Boolean(packCb.checked) }, true);
+      commitGroupPatch({ includeNodePacks: Boolean(packCb.checked) }, true);
     });
     const packSpan = document.createElement("span");
     packSpan.textContent = "+ Node Pack Templates";
@@ -1581,11 +2783,11 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     sourceRow.appendChild(togglesGroup);
     hostDiv.appendChild(sourceRow);
 
-    // Family Filter Chips (multi-select, persisted per workflow in wfState.activeTags)
-    const pool = getPoolForWorkflowState(wfState);
+    // 5. Family Filter Chips (multi-select, persisted per group in activeGroup.activeTags)
+    const pool = getPoolForGroup(activeGroup);
     const familyCounts = computeFamilyCounts(pool);
     const validFamilyKeys = new Set(familyCounts.map((entry) => entry.key));
-    const activeTags = (Array.isArray(wfState.activeTags) ? wfState.activeTags : []).filter((k) =>
+    const activeTags = (Array.isArray(activeGroup.activeTags) ? activeGroup.activeTags : []).filter((k) =>
       validFamilyKeys.has(k)
     );
     if (familyCounts.length > 0) {
@@ -1615,7 +2817,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
           } else {
             nextTags = [...activeTags, tagKey];
           }
-          commitWfState({ ...wfState, activeTags: nextTags }, true);
+          commitGroupPatch({ activeTags: nextTags }, true);
         });
         return btn;
       };
@@ -1627,7 +2829,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       hostDiv.appendChild(chipStrip);
     }
 
-    // Search filter input
+    // 6. Search filter input
     const searchRow = document.createElement("div");
     searchRow.className = "inv7-wfs-folder-row";
     const searchInput = document.createElement("input");
@@ -1663,7 +2865,7 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     bulkRow.style.flexWrap = "wrap";
     const bulkLbl = document.createElement("span");
     bulkLbl.className = "inv7-wfs-label";
-    bulkLbl.textContent = "Check favorite workflows for this workflow:";
+    bulkLbl.textContent = "Workflows in group \"" + activeGroup.name + "\":";
     const btnGroup = document.createElement("div");
     btnGroup.style.display = "flex";
     btnGroup.style.flexWrap = "wrap";
@@ -1674,11 +2876,14 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     allBtn.className = "inv7-wfs-btn";
     allBtn.textContent = "All visible";
     allBtn.addEventListener("click", () => {
-      const nextFavs = new Set(wfState.favorites);
+      const nextFavs = new Set(activeGroup.favorites);
+      const nextLabels = { ...(activeGroup.favoriteLabels || {}) };
       for (const w of getVisibleWorkflows()) {
-        nextFavs.add(getItemFavoriteKey(w));
+        const k = getItemFavoriteKey(w);
+        nextFavs.add(k);
+        if (w.name) nextLabels[k] = w.name;
       }
-      commitWfState({ ...wfState, favorites: Array.from(nextFavs) }, true);
+      commitGroupPatch({ favorites: Array.from(nextFavs), favoriteLabels: nextLabels }, true);
     });
 
     const noneBtn = document.createElement("button");
@@ -1687,47 +2892,15 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     noneBtn.textContent = "None visible";
     noneBtn.addEventListener("click", () => {
       const removeKeys = new Set();
+      const nextLabels = { ...(activeGroup.favoriteLabels || {}) };
       for (const w of getVisibleWorkflows()) {
-        removeKeys.add(getItemFavoriteKey(w));
+        const k = getItemFavoriteKey(w);
+        removeKeys.add(k);
         removeKeys.add(((w && w.name) || "").trim().toLowerCase());
+        delete nextLabels[k];
       }
-      const nextFavs = (wfState.favorites || []).filter((k) => !removeKeys.has(k));
-      commitWfState({ ...wfState, favorites: nextFavs }, true);
-    });
-
-    const saveGlobalBtn = document.createElement("button");
-    saveGlobalBtn.type = "button";
-    saveGlobalBtn.className = "inv7-wfs-btn";
-    saveGlobalBtn.title = "Save this workflow's favorite selection as the Global Favorites preset for new/other workflows";
-    saveGlobalBtn.textContent = "★ Save to Global";
-    saveGlobalBtn.addEventListener("click", () => {
-      switcherConfig.globalFavorites = [...(wfState.favorites || [])];
-      switcherConfig.globalActiveTags = [...(wfState.activeTags || [])];
-      switcherConfig.globalIncludeNodePacks = Boolean(wfState.includeNodePacks);
-      switcherConfig.globalIncludeBrowse = Boolean(wfState.includeBrowse);
-      saveConfig(switcherConfig);
-      saveGlobalBtn.textContent = "✓ Saved Global!";
-      window.setTimeout(() => {
-        saveGlobalBtn.textContent = "★ Save to Global";
-      }, 1400);
-    });
-
-    const loadGlobalBtn = document.createElement("button");
-    loadGlobalBtn.type = "button";
-    loadGlobalBtn.className = "inv7-wfs-btn";
-    loadGlobalBtn.title = "Load your saved Global Favorites selection into this workflow";
-    loadGlobalBtn.textContent = "↓ Load Global";
-    loadGlobalBtn.addEventListener("click", () => {
-      commitWfState(
-        {
-          ...wfState,
-          favorites: Array.isArray(switcherConfig.globalFavorites) ? [...switcherConfig.globalFavorites] : [],
-          activeTags: Array.isArray(switcherConfig.globalActiveTags) ? [...switcherConfig.globalActiveTags] : [],
-          includeNodePacks: Boolean(switcherConfig.globalIncludeNodePacks),
-          includeBrowse: Boolean(switcherConfig.globalIncludeBrowse)
-        },
-        true
-      );
+      const nextFavs = (activeGroup.favorites || []).filter((k) => !removeKeys.has(k));
+      commitGroupPatch({ favorites: nextFavs, favoriteLabels: nextLabels }, true);
     });
 
     const updateYoursBtn = document.createElement("button");
@@ -1735,23 +2908,34 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     updateYoursBtn.className = "inv7-wfs-btn";
     updateYoursBtn.style.borderColor = "rgba(90, 200, 250, 0.45)";
     updateYoursBtn.style.color = "rgb(147, 226, 255)";
-    updateYoursBtn.title = "Directly update this workflow in 'Your Library' in place (without creating a duplicate copy)";
-    updateYoursBtn.textContent = "💾 Save / Update in Yours";
+    updateYoursBtn.title = "Copy checked Node Pack / Browse workflows into 'Your Library' or update your existing copy in place";
+    updateYoursBtn.textContent = "💾 Copy / Save to Yours";
     updateYoursBtn.addEventListener("click", () => {
       saveOrUpdateCurrentWorkflowInYours(hostDiv, updateYoursBtn);
+    });
+
+    const removeYoursBtn = document.createElement("button");
+    removeYoursBtn.type = "button";
+    removeYoursBtn.className = "inv7-wfs-btn";
+    removeYoursBtn.style.borderColor = "rgba(248, 113, 113, 0.45)";
+    removeYoursBtn.style.color = "rgb(252, 165, 165)";
+    removeYoursBtn.title =
+      "Remove checked workflows of this group from 'Your Library' (Yours) so their fresh Node Pack / Built-in templates reappear";
+    removeYoursBtn.textContent = "🗑 Remove Checked from Yours";
+    removeYoursBtn.addEventListener("click", () => {
+      removeCheckedWorkflowsOfActiveGroupFromYours(removeYoursBtn);
     });
 
     const rescanBtn = document.createElement("button");
     rescanBtn.type = "button";
     rescanBtn.className = "inv7-wfs-btn";
     rescanBtn.textContent = "↻ Refresh";
-    rescanBtn.addEventListener("click", () => refreshAllWorkflows());
+    rescanBtn.addEventListener("click", () => refreshAllWorkflows({ forceRender: true }));
 
     btnGroup.appendChild(allBtn);
     btnGroup.appendChild(noneBtn);
-    btnGroup.appendChild(saveGlobalBtn);
-    btnGroup.appendChild(loadGlobalBtn);
     btnGroup.appendChild(updateYoursBtn);
+    btnGroup.appendChild(removeYoursBtn);
     btnGroup.appendChild(rescanBtn);
     bulkRow.appendChild(bulkLbl);
     bulkRow.appendChild(btnGroup);
@@ -1762,8 +2946,38 @@ _WORKFLOW_SWITCHER_JS: str = r"""
 
     function renderChecklistItems() {
       listEl.innerHTML = "";
+      // Show deleted/missing workflows at the top of the checklist struck through so the user can uncheck them:
+      for (const m of missingItems) {
+        const mRow = document.createElement("label");
+        mRow.className = "inv7-wfs-checkitem";
+        mRow.setAttribute("data-missing", "true");
+        const mCb = document.createElement("input");
+        mCb.type = "checkbox";
+        mCb.checked = true;
+        mCb.addEventListener("change", () => {
+          const nextFavs = (activeGroup.favorites || []).filter(
+            (k) => String(k).trim().toLowerCase() !== m.key
+          );
+          const nextLabels = { ...(activeGroup.favoriteLabels || {}) };
+          delete nextLabels[m.key];
+          commitGroupPatch({ favorites: nextFavs, favoriteLabels: nextLabels }, true);
+        });
+        const mName = document.createElement("span");
+        mName.className = "inv7-wfs-checkitem-name";
+        mName.textContent = m.label;
+        mName.title = m.label + " (deleted or renamed — uncheck to remove from group)";
+        const mTag = document.createElement("span");
+        mTag.className = "inv7-wfs-source-tag";
+        mTag.setAttribute("data-source-kind", "missing");
+        mTag.textContent = "Deleted / Missing";
+        mRow.appendChild(mCb);
+        mRow.appendChild(mName);
+        mRow.appendChild(mTag);
+        listEl.appendChild(mRow);
+      }
+
       const visible = getVisibleWorkflows();
-      if (visible.length === 0) {
+      if (visible.length === 0 && missingItems.length === 0) {
         const emptyMsg = document.createElement("div");
         emptyMsg.className = "inv7-wfs-desc";
         emptyMsg.textContent =
@@ -1791,13 +3005,19 @@ _WORKFLOW_SWITCHER_JS: str = r"""
         prevFamily = family;
         const cb = document.createElement("input");
         cb.type = "checkbox";
-        cb.checked = isItemFavoritedInState(wfState, item);
+        cb.checked = isItemFavoritedInGroup(activeGroup, item);
         cb.addEventListener("change", () => {
           const favKey = getItemFavoriteKey(item);
           const nameKey = ((item && item.name) || "").trim().toLowerCase();
-          const currentFavs = (wfState.favorites || []).filter((k) => k !== favKey && k !== nameKey);
+          const currentFavs = (activeGroup.favorites || []).filter((k) => k !== favKey && k !== nameKey);
           const nextFavs = cb.checked ? [...currentFavs, favKey] : currentFavs;
-          commitWfState({ ...wfState, favorites: nextFavs }, false);
+          const nextLabels = { ...(activeGroup.favoriteLabels || {}) };
+          if (cb.checked && item.name) {
+            nextLabels[favKey] = item.name;
+          } else {
+            delete nextLabels[favKey];
+          }
+          commitGroupPatch({ favorites: nextFavs, favoriteLabels: nextLabels }, false);
         });
         const nameSpan = document.createElement("span");
         nameSpan.className = "inv7-wfs-checkitem-name";
@@ -1809,8 +3029,10 @@ _WORKFLOW_SWITCHER_JS: str = r"""
           srcSpan.setAttribute("data-source-kind", "pack");
         } else if (isBrowse) {
           srcSpan.setAttribute("data-source-kind", "browse");
+        } else if (item.ownership && item.ownership !== "own") {
+          srcSpan.setAttribute("data-source-kind", item.ownership);
         }
-        srcSpan.textContent = isPack ? "Node Pack" : isBrowse ? "Built-in (Browse)" : "Your Library";
+        srcSpan.textContent = isPack ? "Node Pack" : isBrowse ? "Built-in (Browse)" : item.source || LIBRARY_SOURCE_LABELS.own;
         row.appendChild(cb);
         row.appendChild(nameSpan);
         row.appendChild(srcSpan);
@@ -1945,8 +3167,14 @@ _WORKFLOW_SWITCHER_JS: str = r"""
       if (!hostDiv) {
         hostDiv = document.createElement("div");
         hostDiv.className = "inv7-wfs-edit-box";
+        hostDiv.setAttribute("data-bound-marker", val);
+        // Prevent InvokeAI's Form Builder drag-and-drop (@dnd-kit) from stealing pointer/keyboard events inside inputs:
+        hostDiv.addEventListener("pointerdown", (e) => e.stopPropagation());
+        hostDiv.addEventListener("mousedown", (e) => e.stopPropagation());
+        hostDiv.addEventListener("keydown", (e) => e.stopPropagation());
         card.appendChild(hostDiv);
         renderEditCardControls(hostDiv, ta);
+        maybeAutoRefreshWorkflows();
       } else if (hostDiv.getAttribute("data-bound-marker") !== val) {
         hostDiv.setAttribute("data-bound-marker", val);
         renderEditCardControls(hostDiv, ta);
@@ -1959,13 +3187,20 @@ _WORKFLOW_SWITCHER_JS: str = r"""
    * ========================================================================== */
   function renderViewWidget(hostDiv) {
     hostDiv.innerHTML = "";
+    if (!hostDiv.hasAttribute("data-inv7-hover-bound")) {
+      hostDiv.setAttribute("data-inv7-hover-bound", "true");
+      hostDiv.addEventListener("pointerenter", () => {
+        maybeAutoRefreshWorkflows();
+      });
+    }
     const prevP = hostDiv.previousElementSibling;
     const markerText = prevP && prevP.tagName === "P" ? prevP.textContent || "" : "";
     const wfState = parseWorkflowMarkerState(markerText);
     hostDiv.setAttribute("data-colorized", wfState.colorized ? "true" : "false");
     hostDiv.setAttribute("data-showinfo", wfState.showInfo ? "true" : "false");
     const alwaysShowInfo = wfState.showInfo;
-    const { select, matchedItem, activeName } = buildDropdownSelectElement(wfState);
+    const { select, matchedItem, activeName, activeGroup, missingItems } = buildDropdownSelectElement();
+    const boundViewGroupId = activeGroup.id;
     const activeLabel = matchedItem ? matchedItem.name : activeName;
     const hasDescription = Boolean(matchedItem && matchedItem.description);
     const isDescVisible = hasDescription && (alwaysShowInfo || tempInfoOpen);
@@ -2000,12 +3235,88 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     }
 
     trigger.addEventListener("click", () => {
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
       switcherConfig.collapsedInView = !switcherConfig.collapsedInView;
       saveConfig(switcherConfig);
       renderViewWidget(hostDiv);
     });
 
     headerRow.appendChild(trigger);
+
+    // Subtle mini group-switcher button + native mini dropdown in the right header bar:
+    const allGroups = Array.isArray(switcherConfig.groups) ? switcherConfig.groups : [activeGroup];
+    const miniWrap = document.createElement("div");
+    miniWrap.className = "inv7-wfs-group-mini-wrap";
+    miniWrap.title =
+      allGroups.length > 1
+        ? "Switch workflow group (active: " + activeGroup.name + ")"
+        : "Active workflow group: " + activeGroup.name + " (add or rename groups in Edit tab)";
+    miniWrap.addEventListener("click", (e) => e.stopPropagation());
+    miniWrap.addEventListener("pointerdown", (e) => e.stopPropagation());
+
+    const miniIcon = document.createElement("span");
+    miniIcon.style.display = "inline-flex";
+    miniIcon.style.alignItems = "center";
+    miniIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+
+    const miniLbl = document.createElement("span");
+    miniLbl.className = "inv7-wfs-group-mini-label";
+    miniLbl.textContent = activeGroup.name;
+
+    const miniCaret = document.createElement("span");
+    miniCaret.style.display = "inline-flex";
+    miniCaret.style.alignItems = "center";
+    miniCaret.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`;
+
+    const miniSelect = document.createElement("select");
+    miniSelect.className = "inv7-wfs-group-mini-select";
+    miniSelect.setAttribute("aria-label", "Switch workflow group");
+    attachSelectInteractionGuard(miniSelect);
+    for (const grp of allGroups) {
+      const opt = document.createElement("option");
+      opt.value = grp.id;
+      opt.selected = grp.id === activeGroup.id;
+      const favCount = Array.isArray(grp.favorites) ? grp.favorites.length : 0;
+      opt.textContent = grp.name + " (" + favCount + ")";
+      miniSelect.appendChild(opt);
+    }
+    miniSelect.addEventListener("change", (e) => {
+      e.stopPropagation();
+      if (reloadConfigIfUserChanged()) {
+        rehydrateAllSwitcherWidgets();
+        return;
+      }
+      const nextGroupId = e.target.value;
+      if (switcherConfig.groups.some((g) => g.id === nextGroupId)) {
+        switcherConfig.activeGroupId = nextGroupId;
+        saveConfig(switcherConfig);
+        rehydrateAllSwitcherWidgets();
+      }
+    });
+
+    miniWrap.appendChild(miniIcon);
+    miniWrap.appendChild(miniLbl);
+    miniWrap.appendChild(miniCaret);
+    miniWrap.appendChild(miniSelect);
+    headerRow.appendChild(miniWrap);
+
+    if (isOpen) {
+      const saveYoursIconBtn = document.createElement("button");
+      saveYoursIconBtn.type = "button";
+      saveYoursIconBtn.className = "inv7-wfs-info-btn";
+      saveYoursIconBtn.setAttribute("data-icon-btn", "true");
+      saveYoursIconBtn.setAttribute("aria-label", "Copy or save active workflow to Your Library");
+      saveYoursIconBtn.title = "Copy / Save active workflow to Your Library (Yours)";
+      saveYoursIconBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>`;
+      saveYoursIconBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        saveOrUpdateCurrentWorkflowInYours(hostDiv, saveYoursIconBtn);
+      });
+      headerRow.appendChild(saveYoursIconBtn);
+    }
 
     if (isOpen && hasDescription && !alwaysShowInfo) {
       const infoBtn = document.createElement("button");
@@ -2026,6 +3337,31 @@ _WORKFLOW_SWITCHER_JS: str = r"""
     const body = document.createElement("div");
     body.className = "inv7-wfs-acc-body";
     body.appendChild(select);
+    if (missingItems && missingItems.length > 0) {
+      const warnBar = document.createElement("div");
+      warnBar.className = "inv7-wfs-missing-banner";
+      const warnTxt = document.createElement("span");
+      warnTxt.textContent =
+        "⚠ " +
+        missingItems.length +
+        (missingItems.length === 1
+          ? " workflow in group \"" + activeGroup.name + "\" was deleted:"
+          : " workflows in group \"" + activeGroup.name + "\" were deleted:") +
+        " " +
+        missingItems.map((m) => m.label).join(", ");
+      const cleanBtn = document.createElement("button");
+      cleanBtn.type = "button";
+      cleanBtn.className = "inv7-wfs-btn";
+      cleanBtn.style.borderColor = "rgba(248, 113, 113, 0.55)";
+      cleanBtn.style.color = "#fecaca";
+      cleanBtn.textContent = "🧹 Clean missing";
+      cleanBtn.addEventListener("click", () => {
+        confirmAndCleanMissingForGroup(boundViewGroupId);
+      });
+      warnBar.appendChild(warnTxt);
+      warnBar.appendChild(cleanBtn);
+      body.appendChild(warnBar);
+    }
     if (isDescVisible) {
       const descEl = document.createElement("div");
       descEl.className = "inv7-wfs-desc";
@@ -2076,6 +3412,16 @@ _WORKFLOW_SWITCHER_JS: str = r"""
   }
 
   function rehydrateAllSwitcherWidgets() {
+    const activeEl = document.activeElement;
+    if (
+      activeEl &&
+      activeEl.isConnected &&
+      activeEl.classList &&
+      activeEl.classList.contains("inv7-wfs-select")
+    ) {
+      pendingRehydrateAfterSelect = true;
+      return;
+    }
     for (const editBox of document.querySelectorAll(".inv7-wfs-edit-box")) {
       const card = editBox.parentElement;
       const ta = card ? card.querySelector("textarea") : null;
